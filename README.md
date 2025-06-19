@@ -39,6 +39,14 @@ Enceladus Video Patcher is a realtime video processing application that applies 
 - OpenGL/GLUT
 - C++17 compatible compiler
 
+### Operating System Support:
+- Ubuntu (Primary)
+- Red Hat Enterprise Linux (Will be officially supported later in developemnt, should compile fine as is though dependencies install commands will be different then Ubuntu)
+- Windows (Expect official support later in development, but should compile fine as is if dependancies are solved)
+- Mac OSX (Support will be extended to Mac OSX at a later point in development, expect stability issues as OpenGL in not supported on Mac)
+- FreeBSD (Support for FreeBSD will be extended once other operating systems are in a good state, should compile fine as is, but remains a low priority)
+- Android (If a good solution can be added which integrates well with other operating systems then support will be added)
+
 ## Installation
 
 1. Ensure you have the required dependencies installed:
@@ -52,6 +60,10 @@ Enceladus Video Patcher is a realtime video processing application that applies 
    ```
    g++ -std=c++17 -o enceladus evp_dev.cpp -lopencv_core -lopencv_highgui -lopencv_imgproc -lopencv_videoio -lGL -lGLU -lglut
    ```
+4. Note if some videos don't play you might be missing some video codecs, consider installing:
+  ```
+  sudo apt install ubuntu-restricted-extras
+  ```
 
 ## Usage
 
