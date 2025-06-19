@@ -50,7 +50,7 @@ Enceladus Video Patcher is a realtime video processing application that applies 
 
 3. Compile the application:
    ```
-   g++ -std=c++17 -o enceladus main.cpp -lopencv_core -lopencv_highgui -lopencv_imgproc -lopencv_videoio -lGL -lGLU -lglut
+   g++ -std=c++17 -o enceladus evp_dev.cpp -lopencv_core -lopencv_highgui -lopencv_imgproc -lopencv_videoio -lGL -lGLU -lglut
    ```
 
 ## Usage
