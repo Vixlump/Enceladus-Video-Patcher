@@ -119,8 +119,8 @@ Filters can be enabled/disabled and adjusted in real-time through the UI. The ap
 ### Example
 
 ```
-program --enable-gray --enable-sepia myvideo.mp4
-program --no-ui --enable-blur --enable-vignette video1.avi video2.mov
+enceladus --enable-gray --enable-sepia myvideo.mp4
+enceladus --no-ui --enable-blur --enable-vignette video1.avi video2.mov
 ```
 
 ## Known Issues
