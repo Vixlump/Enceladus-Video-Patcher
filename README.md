@@ -11,7 +11,7 @@ The app runs as **two windows**:
 ## Features
 
 - Real-time video processing with multiple simultaneous filters
-- 15+ visual effects (anaglyph, sequential anaglyph, grayscale, edge, sepia, pixelate, invert, blur, vignette, noise, color balance, scanlines, CRT, glitch, kaleidoscope, night vision, colorize)
+- 15+ visual effects (anaglyph, sequential anaglyph, motion-pop 3D anaglyph, grayscale, edge, sepia, pixelate, invert, blur, vignette, noise, color balance, scanlines, CRT, glitch, kaleidoscope, night vision, colorize)
 - Dual-window control panel + clean output window
 - File browser and webcam picker
 - Video-window placement (sliders, presets, mouse drag move/resize)
@@ -97,7 +97,9 @@ Toggle the same guides from the control panel **Calibration Guides** section.
 --fullscreen
 ```
 
-Filter enable flags: `anaglyph`, `anaglyphseq`, `gray`, `edge`, `sepia`, `pixelate`, `invert`, `blur`, `vignette`, `noise`, `colorbalance`, `scanlines`, `crt`, `glitch`, `kaleidoscope`, `nightvision`, `colorize`.
+Filter enable flags: `anaglyph`, `anaglyphseq`, `motionpop`, `gray`, `edge`, `sepia`, `pixelate`, `invert`, `blur`, `vignette`, `noise`, `colorbalance`, `scanlines`, `crt`, `glitch`, `kaleidoscope`, `nightvision`, `colorize`.
+
+**Motion Pop 3D** (`--enable-motionpop`): tracks large moving regions over time and only pops objects that stay on screen long enough (~0.5–1.5s) and cover a meaningful part of the frame. Brief flicker / small motion is ignored. Sliders: Strictness (higher = fewer / harder-to-qualify pops), Pop Scale.
 
 ### Controls
 

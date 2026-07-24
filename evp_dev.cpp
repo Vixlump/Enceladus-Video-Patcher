@@ -1,6 +1,7 @@
 #include <opencv2/opencv.hpp>
 #include <opencv2/videoio.hpp>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/video.hpp>
 #include <GL/freeglut.h>
 #include <iostream>
 #include <vector>
@@ -244,6 +245,224 @@ public:
     bool hasParam2() const override { return true; }
     std::string param1Name() const override { return "Swap Phase"; }
     std::string param2Name() const override { return "Eye Gain"; }
+};
+
+// Detect large, persistent movers; enlarge only those; anaglyph with extra parallax.
+class MotionPopAnaglyphFilter : public VideoFilter {
+    struct Track {
+        cv::Rect box;
+        cv::Point2f center;
+        double area = 0.0;
+        int age = 0;      // consecutive frames matched
+        int missed = 0;   // frames since last match
+    };
+
+    cv::Ptr<cv::BackgroundSubtractor> subtractor;
+    std::vector<Track> tracks;
+
+    static float rectIoU(const cv::Rect& a, const cv::Rect& b) {
+        int x1 = std::max(a.x, b.x);
+        int y1 = std::max(a.y, b.y);
+        int x2 = std::min(a.x + a.width, b.x + b.width);
+        int y2 = std::min(a.y + a.height, b.y + b.height);
+        int inter = std::max(0, x2 - x1) * std::max(0, y2 - y1);
+        int uni = a.area() + b.area() - inter;
+        return uni > 0 ? static_cast<float>(inter) / uni : 0.0f;
+    }
+
+    static void pasteScaledRoi(cv::Mat& dst, const cv::Mat& srcFrame, const cv::Rect& roi,
+                               float scale, cv::Mat* maskOut) {
+        if (roi.width < 4 || roi.height < 4) return;
+        cv::Rect safe = roi & cv::Rect(0, 0, srcFrame.cols, srcFrame.rows);
+        if (safe.empty()) return;
+
+        cv::Mat patch = srcFrame(safe).clone();
+        cv::Mat big;
+        cv::resize(patch, big, cv::Size(), scale, scale, cv::INTER_LINEAR);
+
+        int cx = safe.x + safe.width / 2;
+        int cy = safe.y + safe.height / 2;
+        int x0 = cx - big.cols / 2;
+        int y0 = cy - big.rows / 2;
+
+        for (int y = 0; y < big.rows; ++y) {
+            int dy = y0 + y;
+            if (dy < 0 || dy >= dst.rows) continue;
+            for (int x = 0; x < big.cols; ++x) {
+                int dx = x0 + x;
+                if (dx < 0 || dx >= dst.cols) continue;
+                dst.at<cv::Vec3b>(dy, dx) = big.at<cv::Vec3b>(y, x);
+                if (maskOut)
+                    maskOut->at<uchar>(dy, dx) = 255;
+            }
+        }
+    }
+
+public:
+    cv::Mat apply(const cv::Mat& frame) override {
+        if (!enabled || frame.empty()) return frame;
+
+        if (!subtractor)
+            subtractor = cv::createBackgroundSubtractorMOG2(300, 20.0, true);
+
+        cv::Mat motion;
+        double learn = 0.03 + param1 * 0.06;
+        subtractor->apply(frame, motion, learn);
+
+        // Stricter cleanup so flicker / noise rarely becomes a candidate
+        int thresh = static_cast<int>(80 + param1 * 100.0f);
+        cv::threshold(motion, motion, thresh, 255, cv::THRESH_BINARY);
+        cv::morphologyEx(motion, motion, cv::MORPH_OPEN,
+                         cv::getStructuringElement(cv::MORPH_ELLIPSE, {5, 5}));
+        cv::morphologyEx(motion, motion, cv::MORPH_CLOSE,
+                         cv::getStructuringElement(cv::MORPH_ELLIPSE, {11, 11}));
+
+        // Only large blobs are candidates (fraction of frame)
+        const double frameArea = static_cast<double>(frame.rows) * frame.cols;
+        const double minArea = frameArea * (0.012 + param1 * 0.028); // ~1.2%–4.0%
+        const int minW = std::max(24, frame.cols / 16);
+        const int minH = std::max(24, frame.rows / 16);
+        // Persist long enough before popping (about 0.5–1.5s at 30fps)
+        const int minAge = 18 + static_cast<int>(param1 * 30.0f); // 18–48 frames
+        const int maxMissed = 10;
+
+        std::vector<std::vector<cv::Point>> contours;
+        cv::findContours(motion, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+        struct Detection { cv::Rect box; cv::Point2f center; double area; };
+        std::vector<Detection> detections;
+        for (const auto& c : contours) {
+            double area = cv::contourArea(c);
+            if (area < minArea) continue;
+            cv::Rect box = cv::boundingRect(c);
+            if (box.width < minW || box.height < minH) continue;
+            // Reject very thin noise strips
+            float aspect = box.width / static_cast<float>(std::max(1, box.height));
+            if (aspect > 8.0f || aspect < 1.0f / 8.0f) continue;
+            detections.push_back({
+                box,
+                cv::Point2f(box.x + box.width * 0.5f, box.y + box.height * 0.5f),
+                area
+            });
+        }
+
+        // Match detections to tracks (greedy by IoU / center distance)
+        std::vector<char> detUsed(detections.size(), 0);
+        for (auto& tr : tracks) {
+            int best = -1;
+            float bestScore = 0.0f;
+            for (size_t i = 0; i < detections.size(); ++i) {
+                if (detUsed[i]) continue;
+                float iou = rectIoU(tr.box, detections[i].box);
+                float dist = cv::norm(tr.center - detections[i].center);
+                float maxDist = 0.12f * std::max(frame.cols, frame.rows);
+                if (iou < 0.15f && dist > maxDist) continue;
+                float score = iou * 2.0f + (1.0f - std::min(1.0f, dist / maxDist));
+                if (score > bestScore) {
+                    bestScore = score;
+                    best = static_cast<int>(i);
+                }
+            }
+            if (best >= 0) {
+                const auto& d = detections[best];
+                tr.box = d.box;
+                tr.center = d.center;
+                tr.area = d.area;
+                tr.age += 1;
+                tr.missed = 0;
+                detUsed[best] = 1;
+            } else {
+                tr.missed += 1;
+            }
+        }
+
+        tracks.erase(std::remove_if(tracks.begin(), tracks.end(),
+                                    [&](const Track& t) { return t.missed > maxMissed; }),
+                     tracks.end());
+
+        for (size_t i = 0; i < detections.size(); ++i) {
+            if (detUsed[i]) continue;
+            Track t;
+            t.box = detections[i].box;
+            t.center = detections[i].center;
+            t.area = detections[i].area;
+            t.age = 1;
+            t.missed = 0;
+            tracks.push_back(t);
+        }
+
+        // Build pop mask ONLY from mature, large tracks
+        cv::Mat scene = frame.clone();
+        cv::Mat popMask = cv::Mat::zeros(frame.rows, frame.cols, CV_8UC1);
+        float popScale = 1.0f + param2 * 1.75f;
+
+        for (const auto& tr : tracks) {
+            if (tr.age < minAge) continue;
+            if (tr.area < minArea) continue;
+
+            cv::Rect box = tr.box;
+            int pad = std::max(6, static_cast<int>(0.05 * std::max(box.width, box.height)));
+            box.x = std::max(0, box.x - pad);
+            box.y = std::max(0, box.y - pad);
+            box.width = std::min(frame.cols - box.x, box.width + 2 * pad);
+            box.height = std::min(frame.rows - box.y, box.height + 2 * pad);
+
+            if (popScale > 1.05f)
+                pasteScaledRoi(scene, frame, box, popScale, &popMask);
+            else
+                cv::rectangle(popMask, box, cv::Scalar(255), cv::FILLED);
+        }
+
+        // Soft disparity only where confirmed pops exist
+        float bgShift = 0.5f + strength * 2.0f;
+        float fgShift = 5.0f + strength * 16.0f;
+        cv::Mat disp(frame.rows, frame.cols, CV_32FC1, cv::Scalar(bgShift));
+        if (cv::countNonZero(popMask) > 0) {
+            disp.setTo(fgShift, popMask);
+            cv::GaussianBlur(disp, disp, cv::Size(31, 31), 0);
+        }
+
+        cv::Mat mapLx(frame.rows, frame.cols, CV_32FC1);
+        cv::Mat mapLy(frame.rows, frame.cols, CV_32FC1);
+        cv::Mat mapRx(frame.rows, frame.cols, CV_32FC1);
+        cv::Mat mapRy(frame.rows, frame.cols, CV_32FC1);
+        for (int y = 0; y < frame.rows; ++y) {
+            const float* drow = disp.ptr<float>(y);
+            float* lx = mapLx.ptr<float>(y);
+            float* ly = mapLy.ptr<float>(y);
+            float* rx = mapRx.ptr<float>(y);
+            float* ry = mapRy.ptr<float>(y);
+            for (int x = 0; x < frame.cols; ++x) {
+                float d = drow[x];
+                lx[x] = x + 0.5f * d;
+                rx[x] = x - 0.5f * d;
+                ly[x] = static_cast<float>(y);
+                ry[x] = static_cast<float>(y);
+            }
+        }
+
+        cv::Mat leftView, rightView;
+        cv::remap(scene, leftView, mapLx, mapLy, cv::INTER_LINEAR, cv::BORDER_REPLICATE);
+        cv::remap(scene, rightView, mapRx, mapRy, cv::INTER_LINEAR, cv::BORDER_REPLICATE);
+
+        cv::Mat output;
+        std::vector<cv::Mat> lch, rch;
+        cv::split(leftView, lch);
+        cv::split(rightView, rch);
+        std::vector<cv::Mat> outCh = {rch[0], rch[1], lch[2]};
+        cv::merge(outCh, output);
+
+        if (strength < 0.999f)
+            cv::addWeighted(frame, 1.0f - strength, output, strength, 0, output);
+
+        return output;
+    }
+
+    std::string name() const override { return "Motion Pop 3D"; }
+    bool hasParam1() const override { return true; }
+    bool hasParam2() const override { return true; }
+    std::string param1Name() const override { return "Strictness"; }
+    std::string param2Name() const override { return "Pop Scale"; }
 };
 
 class GrayscaleFilter : public VideoFilter {
@@ -2885,6 +3104,14 @@ int main(int argc, char** argv) {
     auto anaglyphSeq = std::make_unique<AlternatingAnaglyphFilter>();
     anaglyphSeq->enabled = enabled.count("anaglyphseq") || enabled.count("anaglyph-seq");
     filters.push_back(std::move(anaglyphSeq));
+
+    auto motionPop = std::make_unique<MotionPopAnaglyphFilter>();
+    motionPop->enabled = enabled.count("motionpop") || enabled.count("motion-pop") ||
+                         enabled.count("motion3d");
+    // Default mid sensitivity / mild pop when enabled from CLI without tweaks
+    motionPop->param1 = 0.55f;
+    motionPop->param2 = 0.45f;
+    filters.push_back(std::move(motionPop));
 
     auto gray = std::make_unique<GrayscaleFilter>();
     gray->enabled = enabled.count("gray");
