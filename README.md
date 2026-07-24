@@ -2,158 +2,155 @@
 
 ## Overview
 
-Enceladus Video Patcher is a realtime video processing application that applies various visual effects to video streams or files. Built with OpenCV and OpenGL.
+Enceladus Video Patcher is a realtime video processing application that applies visual effects to video streams or files. Built with OpenCV and OpenGL/FreeGLUT.
+
+The app runs as **two windows**:
+- **Enceladus Video** — video/camera stream only (plus optional calibration guides)
+- **Enceladus Control Panel** — playback, filters, sources, placement, and guides
 
 ## Features
 
-- **Real-time video processing** with multiple simultaneous filters
-- **15+ visual effects** including:
-  - Anaglyph 3D
-  - Grayscale
-  - Edge Detection
-  - Sepia
-  - Pixelation
-  - Inversion
-  - Blur
-  - Vignette
-  - Noise
-  - Color Balance
-  - Scanlines
-  - CRT Effect
-  - Glitch
-  - Kaleidoscope
-  - Night Vision
-  - Colorize
-- **Interactive UI** with:
-  - Playback controls (play/pause, seek, fast forward/rewind)
-  - Filter toggles and parameter adjustment
-  - Pie menu for quick filter selection
-  - Fullscreen mode
-- **Keyboard shortcuts** for quick control
-- **Playlist support** for multiple video files
-- **Adjustable playback speed**
+- Real-time video processing with multiple simultaneous filters
+- 15+ visual effects (anaglyph, grayscale, edge, sepia, pixelate, invert, blur, vignette, noise, color balance, scanlines, CRT, glitch, kaleidoscope, night vision, colorize)
+- Dual-window control panel + clean output window
+- File browser and webcam picker
+- Video-window placement (sliders, presets, mouse drag move/resize)
+- Theater calibration guides (crosshair, edge, thirds, grid, safe areas, aspect frames)
+- Scriptable geometry and guide flags via CLI
+- Playlist support and adjustable playback speed
 
 ## Requirements
 
-- OpenCV (built with videoio module)
-- OpenGL/GLUT
-- C++17 compatible compiler
+- OpenCV (videoio module)
+- OpenGL / FreeGLUT
+- C++17 compiler
 
-### Operating System Support:
-- Ubuntu (Primary)
-- Red Hat Enterprise Linux (Will be officially supported later in developemnt, should compile fine as is though dependencies install commands will be different then Ubuntu)
-- Windows (Expect official support later in development, but should compile fine as is if dependancies are solved)
-- Mac OSX (Support will be extended to Mac OSX at a later point in development, expect stability issues as OpenGL in not supported on Mac)
-- FreeBSD (Support for FreeBSD will be extended once other operating systems are in a good state, should compile fine as is, but remains a low priority)
-- Android (If a good solution can be added which integrates well with other operating systems then support will be added)
+Primary OS: Ubuntu. Other platforms may work with matching dependencies.
 
 ## Installation
 
-1. Ensure you have the required dependencies installed:
-   ```
-   sudo apt-get install build-essential libopencv-dev freeglut3-dev
-   ```
+```bash
+sudo apt-get install build-essential libopencv-dev freeglut3-dev
+./compile.sh
+# or:
+g++ -std=c++17 -o Enceladus_Video_Patcher evp_dev.cpp \
+  `pkg-config --cflags --libs opencv4` -lGL -lGLU -lglut -O2
+```
 
-2. Clone the repository or download the source files
+If some videos will not play:
 
-3. Compile the application:
-   ```
-   g++ -std=c++17 -o enceladus evp_dev.cpp -lopencv_core -lopencv_highgui -lopencv_imgproc -lopencv_videoio -lGL -lGLU -lglut
-   ```
-4. Note if some videos don't play you might be missing some video codecs, consider installing:
-  ```
-  sudo apt install ubuntu-restricted-extras
-  ```
+```bash
+sudo apt install ubuntu-restricted-extras
+```
 
 ## Usage
 
-```
-./enceladus [video_file...] [options]
+```bash
+./Enceladus_Video_Patcher [video_file...] [options]
 ```
 
-### Options
+With no files, camera `0` is used.
 
-- `--enable-[filter]`: Enable specific filter at startup (e.g., `--enable-glitch`)
-- `--no-ui`: Start with UI hidden
-- `--fullscreen`: Start in fullscreen mode
+### Dual windows
+
+| Window | Role |
+|--------|------|
+| Enceladus Video | Stream output; drag center to move, edges/corners to resize |
+| Enceladus Control Panel | All controls, menus, placement, guides |
+
+`--no-ui` starts **video window only** (useful for scripted theater playback).
+
+### Placement options (scriptable)
+
+```bash
+--video-x N --video-y N --video-w N --video-h N
+--video-geometry WxH+X+Y
+--control-x N --control-y N --control-w N --control-h N
+--control-geometry WxH+X+Y
+--preset center|topleft|topright|bottomleft|bottomright|lefthalf|righthalf
+--fullscreen
+```
+
+Examples:
+
+```bash
+./Enceladus_Video_Patcher --video-geometry 1920x1080+0+0 --fullscreen movie.mp4
+./Enceladus_Video_Patcher --preset righthalf --no-ui
+./Enceladus_Video_Patcher --video-x 100 --video-y 50 --video-w 1280 --video-h 720
+```
+
+### Calibration guides
+
+```bash
+--guides
+--guides=cross,edge,thirds,grid,action,title,16:9,4:3,2.39
+--guides=all
+```
+
+Toggle the same guides from the control panel **Calibration Guides** section.
+
+### Filter / UI options
+
+```bash
+--enable-[filter]   # e.g. --enable-glitch
+--no-ui
+--fullscreen
+```
+
+Filter enable flags: `anaglyph`, `gray`, `edge`, `sepia`, `pixelate`, `invert`, `blur`, `vignette`, `noise`, `colorbalance`, `scanlines`, `crt`, `glitch`, `kaleidoscope`, `nightvision`, `colorize`.
 
 ### Controls
 
-#### Keyboard Shortcuts
+#### Keyboard (control panel)
 
 | Key | Action |
 |-----|--------|
 | Space | Play/Pause |
-| L | Toggle looping |
-| N | Next video in playlist |
-| F | Toggle fullscreen |
-| U | Toggle UI visibility |
-| 1-9 | Toggle corresponding filter |
-| -/= | Decrease/increase active slider value |
-| </> | Seek backward/forward 5 seconds |
-| [/] | Decrease/increase playback speed |
+| L | Loop |
+| N | Next playlist item |
+| F | Toggle **video** fullscreen |
+| U | Toggle control UI chrome |
+| V | Open file browser |
+| C | Camera menu |
+| 1-9 | Toggle filters |
+| WASD / O P / R | Content pan/scale / reset view |
+| [/] | Playback speed |
+| ESC | Close menu / exit video fullscreen / quit |
+
+#### Keyboard (video window)
+
+| Key | Action |
+|-----|--------|
+| Space | Play/Pause |
+| F | Fullscreen |
+| G | Toggle crosshair + edge guides |
 | ESC | Exit fullscreen or quit |
 
-#### Mouse Controls
+#### Mouse
 
-- Click progress bar to seek
-- Click filter buttons to toggle effects
-- Drag sliders to adjust parameters
-- Right-click to open pie menu for filter selection
+- **Control panel:** transport, filters, sliders, Open/Cam, placement presets, guide toggles; right-click pie menu
+- **Video window:** drag interior to move; drag edges/corners to resize; right-click toggles crosshair
 
-## Configuration
+## Examples
 
-Filters can be enabled/disabled and adjusted in real-time through the UI. The application remembers the last used settings for each filter during the session.
-
-## Arguments
-```
---enable-anaglyph
---enable-gray
---enable-edge
---enable-sepia
---enable-pixelate
---enable-invert
---enable-blur
---enable-vignette
---enable-noise
---enable-colorbalance
---enable-scanlines
---enable-crt
---enable-glitch
---enable-kaleidoscope
---enable-nightvision
---enable-colorize
-
---no-ui          // Disables the user interface
---fullscreen     // Enables fullscreen mode
-```
-
-### Example
-
-```
-enceladus --enable-gray --enable-sepia myvideo.mp4
-enceladus --no-ui --enable-blur --enable-vignette video1.avi video2.mov
+```bash
+./Enceladus_Video_Patcher --enable-gray --enable-sepia myvideo.mp4
+./Enceladus_Video_Patcher --guides=cross,thirds,action --preset center
+./Enceladus_Video_Patcher --no-ui --video-geometry 1920x1080+1920+0 --guides=all
 ```
 
 ## Known Issues
 
-- Some filters may impact performance on lower-end systems
-- Seeking may not be frame-accurate with certain video formats
-- Fullscreen mode may behave differently across platforms
-
-## Future Improvements
-
-- Save/Load filter presets
-- Screenshot capture functionality
-- Additional filter effects
-- Improved performance optimization
+- Some filters are heavy on low-end GPUs/CPUs
+- Seeking may not be frame-accurate for all codecs
+- Multi-monitor placement is manual (geometry/presets/mouse), not OS monitor enumeration
 
 ## License
 
-This project is licensed under the GPL v3, (please submit patches upstream)
+GPL v3 — please submit patches upstream.
 
 ## Acknowledgments
 
-- OpenCV team for the excellent computer vision library
-- FreeGLUT developers for the OpenGL utility toolkit
-- All contributors and testers
+- OpenCV
+- FreeGLUT
+- Contributors and testers

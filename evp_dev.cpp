@@ -19,6 +19,7 @@
 #include <filesystem>
 #include <fstream>
 #include <cstdlib>
+#include <cstdio>
 
 // Global variables
 cv::Mat latestFrame;
@@ -28,9 +29,24 @@ bool isLooping = false;
 bool showUI = true;
 int currentVideoIndex = 0;
 std::vector<std::string> playlist;
-int windowWidth = 800, windowHeight = 600;
+
+// Dual windows: video (stream only) + control panel
+int videoWindowId = 0;
+int controlWindowId = 0;
+int videoWinX = 100, videoWinY = 100;
+int videoWinW = 800, videoWinH = 600;
+int controlWinW = 960, controlWinH = 720;
+int controlWinX = 920, controlWinY = 80;
+bool videoGeomFromArgs = false;
+bool controlGeomFromArgs = false;
+bool videoFullscreen = false;
+bool controlFullscreen = false;
+// Saved when entering control fullscreen
+int controlSavedX = 920, controlSavedY = 80, controlSavedW = 960, controlSavedH = 720;
+
+// Legacy aliases used by control-window UI coordinate math
+int windowWidth = 960, windowHeight = 720;
 float uiScale = 1.0f;
-bool fullscreen = false;
 int activeSlider = -1; // -1 means no slider is active
 bool isSeeking = false;
 double videoDuration = 0;
@@ -39,6 +55,13 @@ double lastFrameTime = 0;
 bool mouseLeftDown = false;
 float fastForwardSpeed = 1.0f;
 const float MAX_FF_SPEED = 16.0f;
+
+// Video-window drag placement
+enum class VideoDragMode { None, Move, ResizeW, ResizeE, ResizeN, ResizeS, ResizeNW, ResizeNE, ResizeSW, ResizeSE };
+VideoDragMode videoDragMode = VideoDragMode::None;
+int dragStartScreenX = 0, dragStartScreenY = 0;
+int dragGeomX = 0, dragGeomY = 0, dragGeomW = 0, dragGeomH = 0;
+const int VIDEO_DRAG_EDGE = 14;
 
 //pi menu vars
 
@@ -49,13 +72,36 @@ int pieHoverIndex = -1;
 const float PIE_MENU_RADIUS = 0.40f;
 const float PIE_MENU_INNER = 0.10f;
 
-// Video placement within the window (1.0 = fit, offsets are normalized -1..1)
+// Video content placement within the video window (1.0 = fit, offsets are normalized -1..1)
 float videoScale = 1.0f;
 float videoOffsetX = 0.0f;
 float videoOffsetY = 0.0f;
 int activeViewSlider = -1; // 0=scale, 1=posX, 2=posY
 const float VIDEO_SCALE_MIN = 0.2f;
 const float VIDEO_SCALE_MAX = 2.0f;
+
+// Window geometry placement sliders (normalized against screen size)
+int activePlaceSlider = -1; // 0=x 1=y 2=w 3=h
+const int VIDEO_MIN_W = 160;
+const int VIDEO_MIN_H = 120;
+
+// Theater calibration guides (drawn on video window)
+bool guideCrosshair = false;
+bool guideEdgeBorder = false;
+bool guideThirds = false;
+bool guideGrid = false;
+bool guideActionSafe = false;
+bool guideTitleSafe = false;
+bool guideAspect169 = false;
+bool guideAspect43 = false;
+bool guideAspect239 = false;
+
+// Control-panel layout: guides/placement sit in a middle column so Active Effects
+// can use the full left column for filter sliders.
+const float GUIDE_PANEL_X = -0.45f;
+const float GUIDE_PANEL_Y = 0.58f;
+const float PLACE_PANEL_X = -0.45f;
+const float PLACE_PANEL_Y = 0.10f;
 
 // Source picker menus (file browser / webcam list)
 enum class SourceMenuMode { None, Files, Cameras };
@@ -1059,18 +1105,18 @@ void drawButton(float x, float y, float w, float h, const std::string& label, bo
 
 void drawSlider(float x, float y, float w, float h, float value, const std::string& label);
 
-// Active-effects panel sits on the left so sliders never overlap the filter buttons.
+// Active-effects panel on the left — tall enough for multiple filter sliders.
 const float AE_PANEL_X = -0.95f;
 const float AE_PANEL_W = 0.48f;
 const float AE_CONTENT_X = -0.93f;
 const float AE_SLIDER_W = 0.42f;
 const float AE_SLIDER_H = 0.025f;
-const float AE_TOP_Y = 0.78f;
+const float AE_TOP_Y = 0.82f;
 const float AE_TITLE_STEP = 0.06f;
 const float AE_NAME_STEP = 0.05f;
 const float AE_SLIDER_STEP = 0.07f;
 const float AE_FILTER_GAP = 0.035f;
-const float AE_BOTTOM_LIMIT = -0.72f;
+const float AE_BOTTOM_LIMIT = -0.58f;
 
 bool anyFilterEnabled() {
     for (const auto& filter : filters) {
@@ -1437,6 +1483,15 @@ bool hitTestViewControls(float fx, float fy) {
     return false;
 }
 
+bool hitTestViewControls(float fx, float fy);
+
+void postRedisplayBoth();
+void setVideoFullscreen(bool enable);
+void setControlFullscreen(bool enable);
+void applyVideoGeometry();
+bool hitTestPlacementPanel(float fx, float fy);
+bool hitTestGuidesPanel(float fx, float fy);
+
 void mouse(int button, int state, int x, int y) {
     if (!showUI || windowWidth < 1 || windowHeight < 1) return;
 
@@ -1514,14 +1569,12 @@ void mouse(int button, int state, int x, int y) {
                 openCameraMenu();
                 return;
             }
-            else if (isInside(fx, fy, 0.8f, -0.85f, 0.15f * uiScale, 0.08f * uiScale)) {
-                fullscreen = !fullscreen;
-                if (fullscreen) {
-                    glutFullScreen();
-                } else {
-                    glutReshapeWindow(800, 600);
-                    glutPositionWindow(100, 100);
-                }
+            else if (isInside(fx, fy, 0.45f, -0.85f, 0.14f * uiScale, 0.08f * uiScale)) {
+                setVideoFullscreen(!videoFullscreen);
+                return;
+            }
+            else if (isInside(fx, fy, 0.62f, -0.85f, 0.14f * uiScale, 0.08f * uiScale)) {
+                setControlFullscreen(!controlFullscreen);
                 return;
             }
 
@@ -1537,6 +1590,13 @@ void mouse(int button, int state, int x, int y) {
 
             // Active Effects panel sliders (left side)
             if (hitTestActiveEffectsSliders(fx, fy)) {
+                return;
+            }
+
+            if (hitTestPlacementPanel(fx, fy)) {
+                return;
+            }
+            if (hitTestGuidesPanel(fx, fy)) {
                 return;
             }
 
@@ -1594,6 +1654,7 @@ void mouse(int button, int state, int x, int y) {
         } else if (state == GLUT_UP) {
             activeSlider = -1;
             activeViewSlider = -1;
+            activePlaceSlider = -1;
             isSeeking = false;
         }
     }
@@ -1614,6 +1675,28 @@ void mouseMotion(int x, int y) {
 
     if (!showUI) return;
 
+    if (activePlaceSlider >= 0 && mouseLeftDown) {
+        int sw = std::max(1, glutGet(GLUT_SCREEN_WIDTH));
+        int sh = std::max(1, glutGet(GLUT_SCREEN_HEIGHT));
+        float norm = 0.0f;
+        if (activePlaceSlider == 0 || activePlaceSlider == 2)
+            norm = (fx - (PLACE_PANEL_X + 0.02f)) / 0.22f;
+        else
+            norm = (fx - (PLACE_PANEL_X + 0.28f)) / 0.22f;
+        // Y and H use the right column; detect by slider id
+        if (activePlaceSlider == 1 || activePlaceSlider == 3)
+            norm = (fx - (PLACE_PANEL_X + 0.28f)) / 0.22f;
+        if (activePlaceSlider == 0 || activePlaceSlider == 2)
+            norm = (fx - (PLACE_PANEL_X + 0.02f)) / 0.22f;
+        norm = std::max(0.0f, std::min(1.0f, norm));
+        if (activePlaceSlider == 0) videoWinX = int(norm * std::max(1, sw - videoWinW));
+        else if (activePlaceSlider == 1) videoWinY = int(norm * std::max(1, sh - videoWinH));
+        else if (activePlaceSlider == 2) videoWinW = VIDEO_MIN_W + int(norm * std::max(1, sw - VIDEO_MIN_W));
+        else if (activePlaceSlider == 3) videoWinH = VIDEO_MIN_H + int(norm * std::max(1, sh - VIDEO_MIN_H));
+        postRedisplayBoth();
+        return;
+    }
+
     if (activeViewSlider >= 0 && mouseLeftDown) {
         float norm = 0.0f;
         if (activeViewSlider == 0)
@@ -1629,7 +1712,7 @@ void mouseMotion(int x, int y) {
             videoOffsetX = norm * 2.0f - 1.0f;
         else
             videoOffsetY = norm * 2.0f - 1.0f;
-        glutPostRedisplay();
+        glutPostRedisplay(); // control window only is fine for slider drag
         return;
     }
 
@@ -1666,10 +1749,10 @@ void keyboard(unsigned char key, int x, int y) {
                 closeSourceMenu();
             } else if (showPieMenu) {
                 showPieMenu = false;
-            } else if (fullscreen) {
-                fullscreen = false;
-                glutReshapeWindow(800, 600);
-                glutPositionWindow(100, 100);
+            } else if (videoFullscreen) {
+                setVideoFullscreen(false);
+            } else if (controlFullscreen) {
+                setControlFullscreen(false);
             } else {
                 exit(0);
             }
@@ -1691,13 +1774,11 @@ void keyboard(unsigned char key, int x, int y) {
             break;
         case 'f':
         case 'F':
-            fullscreen = !fullscreen;
-            if (fullscreen) {
-                glutFullScreen();
-            } else {
-                glutReshapeWindow(800, 600);
-                glutPositionWindow(100, 100);
-            }
+            setVideoFullscreen(!videoFullscreen);
+            break;
+        case 'h':
+        case 'H':
+            setControlFullscreen(!controlFullscreen);
             break;
         case 'u':
         case 'U':
@@ -1808,7 +1889,7 @@ void keyboard(unsigned char key, int x, int y) {
 }
 
 void displayVideoFrame(const cv::Mat& frame) {
-    if (frame.empty() || windowWidth < 1 || windowHeight < 1) return;
+    if (frame.empty() || videoWinW < 1 || videoWinH < 1) return;
     if (frame.cols < 1 || frame.rows < 1) return;
 
     cv::Mat rgb;
@@ -1825,27 +1906,27 @@ void displayVideoFrame(const cv::Mat& frame) {
     if (rgb.empty() || rgb.cols < 1 || rgb.rows < 1) return;
 
     float frameAspect = static_cast<float>(rgb.cols) / static_cast<float>(rgb.rows);
-    float windowAspect = static_cast<float>(windowWidth) / static_cast<float>(windowHeight);
+    float windowAspect = static_cast<float>(videoWinW) / static_cast<float>(videoWinH);
 
     // Fit-contain size, then apply user scale
     float fitW, fitH;
     if (frameAspect > windowAspect) {
-        fitW = static_cast<float>(windowWidth);
+        fitW = static_cast<float>(videoWinW);
         fitH = fitW / frameAspect;
     } else {
-        fitH = static_cast<float>(windowHeight);
+        fitH = static_cast<float>(videoWinH);
         fitW = fitH * frameAspect;
     }
 
     int drawWidth = std::max(1, static_cast<int>(fitW * videoScale + 0.5f));
     int drawHeight = std::max(1, static_cast<int>(fitH * videoScale + 0.5f));
     // Cap allocation size to avoid huge temporaries while still allowing zoom via ROI clip
-    const int maxDim = std::max(windowWidth, windowHeight) * 4;
+    const int maxDim = std::max(videoWinW, videoWinH) * 4;
     drawWidth = std::min(drawWidth, std::max(1, maxDim));
     drawHeight = std::min(drawHeight, std::max(1, maxDim));
 
-    int offsetX = (windowWidth - drawWidth) / 2 + static_cast<int>(videoOffsetX * windowWidth * 0.5f);
-    int offsetY = (windowHeight - drawHeight) / 2 + static_cast<int>(videoOffsetY * windowHeight * 0.5f);
+    int offsetX = (videoWinW - drawWidth) / 2 + static_cast<int>(videoOffsetX * videoWinW * 0.5f);
+    int offsetY = (videoWinH - drawHeight) / 2 + static_cast<int>(videoOffsetY * videoWinH * 0.5f);
 
     cv::Mat resized;
     try {
@@ -1863,8 +1944,8 @@ void displayVideoFrame(const cv::Mat& frame) {
     int dstW = drawWidth, dstH = drawHeight;
     if (dstX < 0) { srcX = -dstX; dstW += dstX; dstX = 0; }
     if (dstY < 0) { srcY = -dstY; dstH += dstY; dstY = 0; }
-    if (dstX + dstW > windowWidth) dstW = windowWidth - dstX;
-    if (dstY + dstH > windowHeight) dstH = windowHeight - dstY;
+    if (dstX + dstW > videoWinW) dstW = videoWinW - dstX;
+    if (dstY + dstH > videoWinH) dstH = videoWinH - dstY;
     if (dstW <= 0 || dstH <= 0) return;
     if (srcX + dstW > resized.cols) dstW = resized.cols - srcX;
     if (srcY + dstH > resized.rows) dstH = resized.rows - srcY;
@@ -1874,10 +1955,10 @@ void displayVideoFrame(const cv::Mat& frame) {
     if (!roi.isContinuous())
         roi = roi.clone();
 
-    glViewport(0, 0, windowWidth, windowHeight);
+    glViewport(0, 0, videoWinW, videoWinH);
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
-    gluOrtho2D(0.0, static_cast<double>(windowWidth), 0.0, static_cast<double>(windowHeight));
+    gluOrtho2D(0.0, static_cast<double>(videoWinW), 0.0, static_cast<double>(videoWinH));
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
 
@@ -1889,7 +1970,7 @@ void displayVideoFrame(const cv::Mat& frame) {
         glDrawPixels(dstW, dstH, GL_RGB, GL_UNSIGNED_BYTE, roi.data);
     }
 
-    // Reset for UI
+    // Reset for overlays (normalized -1..1)
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
     gluOrtho2D(-1.0, 1.0, -1.0, 1.0);
@@ -1897,69 +1978,433 @@ void displayVideoFrame(const cv::Mat& frame) {
     glLoadIdentity();
 }
 
-void display() {
+void postRedisplayBoth() {
+    // Prefer window-specific post so we don't change the current window
+    // (changing current after glutFullScreen can FS the wrong window).
+    if (videoWindowId)
+        glutPostWindowRedisplay(videoWindowId);
+    if (controlWindowId)
+        glutPostWindowRedisplay(controlWindowId);
+}
+
+void syncVideoGeomFromWindow() {
+    if (!videoWindowId) return;
+    int prev = glutGetWindow();
+    glutSetWindow(videoWindowId);
+    videoWinX = glutGet(GLUT_WINDOW_X);
+    videoWinY = glutGet(GLUT_WINDOW_Y);
+    videoWinW = std::max(1, glutGet(GLUT_WINDOW_WIDTH));
+    videoWinH = std::max(1, glutGet(GLUT_WINDOW_HEIGHT));
+    if (prev > 0 && prev != videoWindowId)
+        glutSetWindow(prev);
+}
+
+void applyVideoGeometry() {
+    if (!videoWindowId) return;
+    // Always target the video window; do not restore previous current window
+    // before geometry ops finish (FreeGLUT can apply them to the wrong window).
+    glutSetWindow(videoWindowId);
+    videoWinW = std::max(VIDEO_MIN_W, videoWinW);
+    videoWinH = std::max(VIDEO_MIN_H, videoWinH);
+    if (videoFullscreen) {
+        glutFullScreen();
+    } else {
+        glutPositionWindow(videoWinX, videoWinY);
+        glutReshapeWindow(videoWinW, videoWinH);
+    }
+}
+
+void setVideoFullscreen(bool enable) {
+    if (!videoWindowId) return;
+    glutSetWindow(videoWindowId);
+    if (enable) {
+        if (!videoFullscreen) {
+            videoWinX = glutGet(GLUT_WINDOW_X);
+            videoWinY = glutGet(GLUT_WINDOW_Y);
+            videoWinW = std::max(VIDEO_MIN_W, glutGet(GLUT_WINDOW_WIDTH));
+            videoWinH = std::max(VIDEO_MIN_H, glutGet(GLUT_WINDOW_HEIGHT));
+        }
+        videoFullscreen = true;
+        glutFullScreen();
+    } else {
+        videoFullscreen = false;
+        glutReshapeWindow(std::max(VIDEO_MIN_W, videoWinW), std::max(VIDEO_MIN_H, videoWinH));
+        glutPositionWindow(videoWinX, videoWinY);
+    }
+}
+
+void setControlFullscreen(bool enable) {
+    if (!controlWindowId) return;
+    glutSetWindow(controlWindowId);
+    if (enable) {
+        if (!controlFullscreen) {
+            controlSavedX = glutGet(GLUT_WINDOW_X);
+            controlSavedY = glutGet(GLUT_WINDOW_Y);
+            controlSavedW = std::max(1, glutGet(GLUT_WINDOW_WIDTH));
+            controlSavedH = std::max(1, glutGet(GLUT_WINDOW_HEIGHT));
+            controlWinX = controlSavedX;
+            controlWinY = controlSavedY;
+            controlWinW = controlSavedW;
+            controlWinH = controlSavedH;
+        }
+        controlFullscreen = true;
+        glutFullScreen();
+    } else {
+        controlFullscreen = false;
+        glutReshapeWindow(std::max(1, controlSavedW), std::max(1, controlSavedH));
+        glutPositionWindow(controlSavedX, controlSavedY);
+        controlWinW = controlSavedW;
+        controlWinH = controlSavedH;
+        windowWidth = controlWinW;
+        windowHeight = controlWinH;
+    }
+}
+
+void placeVideoPreset(const std::string& name) {
+    int sw = std::max(1, glutGet(GLUT_SCREEN_WIDTH));
+    int sh = std::max(1, glutGet(GLUT_SCREEN_HEIGHT));
+    videoFullscreen = false;
+    if (name == "center") {
+        videoWinW = std::min(sw * 2 / 3, 1280);
+        videoWinH = std::min(sh * 2 / 3, 720);
+        videoWinX = (sw - videoWinW) / 2;
+        videoWinY = (sh - videoWinH) / 2;
+    } else if (name == "topleft") {
+        videoWinW = sw / 2; videoWinH = sh / 2;
+        videoWinX = 0; videoWinY = 0;
+    } else if (name == "topright") {
+        videoWinW = sw / 2; videoWinH = sh / 2;
+        videoWinX = sw / 2; videoWinY = 0;
+    } else if (name == "bottomleft") {
+        videoWinW = sw / 2; videoWinH = sh / 2;
+        videoWinX = 0; videoWinY = sh / 2;
+    } else if (name == "bottomright") {
+        videoWinW = sw / 2; videoWinH = sh / 2;
+        videoWinX = sw / 2; videoWinY = sh / 2;
+    } else if (name == "lefthalf") {
+        videoWinW = sw / 2; videoWinH = sh;
+        videoWinX = 0; videoWinY = 0;
+    } else if (name == "righthalf") {
+        videoWinW = sw / 2; videoWinH = sh;
+        videoWinX = sw / 2; videoWinY = 0;
+    } else if (name == "fullscreen") {
+        setVideoFullscreen(true);
+        return;
+    }
+    applyVideoGeometry();
+}
+
+void drawGuideRect(float x0, float y0, float x1, float y1) {
+    glBegin(GL_LINE_LOOP);
+    glVertex2f(x0, y0);
+    glVertex2f(x1, y0);
+    glVertex2f(x1, y1);
+    glVertex2f(x0, y1);
+    glEnd();
+}
+
+void drawAspectGuide(float aspect) {
+    // aspect = width/height of frame overlay inside window
+    float winAspect = static_cast<float>(videoWinW) / static_cast<float>(videoWinH);
+    float x0 = -1.0f, y0 = -1.0f, x1 = 1.0f, y1 = 1.0f;
+    if (aspect > winAspect) {
+        float h = winAspect / aspect;
+        y0 = -h; y1 = h;
+    } else {
+        float w = aspect / winAspect;
+        x0 = -w; x1 = w;
+    }
+    drawGuideRect(x0, y0, x1, y1);
+}
+
+void drawCalibrationGuides() {
+    bool any = guideCrosshair || guideEdgeBorder || guideThirds || guideGrid ||
+               guideActionSafe || guideTitleSafe || guideAspect169 ||
+               guideAspect43 || guideAspect239;
+    if (!any) return;
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glLineWidth(1.0f);
+
+    if (guideGrid) {
+        glColor4f(1.0f, 1.0f, 1.0f, 0.18f);
+        glBegin(GL_LINES);
+        for (int i = 1; i < 8; ++i) {
+            float t = -1.0f + i * (2.0f / 8.0f);
+            glVertex2f(t, -1.0f); glVertex2f(t, 1.0f);
+            glVertex2f(-1.0f, t); glVertex2f(1.0f, t);
+        }
+        glEnd();
+    }
+
+    if (guideThirds) {
+        glColor4f(0.3f, 0.9f, 1.0f, 0.75f);
+        glBegin(GL_LINES);
+        glVertex2f(-1.0f / 3.0f, -1.0f); glVertex2f(-1.0f / 3.0f, 1.0f);
+        glVertex2f( 1.0f / 3.0f, -1.0f); glVertex2f( 1.0f / 3.0f, 1.0f);
+        glVertex2f(-1.0f, -1.0f / 3.0f); glVertex2f(1.0f, -1.0f / 3.0f);
+        glVertex2f(-1.0f,  1.0f / 3.0f); glVertex2f(1.0f,  1.0f / 3.0f);
+        glEnd();
+    }
+
+    if (guideActionSafe) {
+        glColor4f(1.0f, 0.85f, 0.2f, 0.85f);
+        drawGuideRect(-0.9f, -0.9f, 0.9f, 0.9f);
+    }
+    if (guideTitleSafe) {
+        glColor4f(1.0f, 0.4f, 0.2f, 0.85f);
+        drawGuideRect(-0.8f, -0.8f, 0.8f, 0.8f);
+    }
+
+    if (guideAspect169) {
+        glColor4f(0.4f, 1.0f, 0.5f, 0.9f);
+        drawAspectGuide(16.0f / 9.0f);
+    }
+    if (guideAspect43) {
+        glColor4f(0.5f, 0.7f, 1.0f, 0.9f);
+        drawAspectGuide(4.0f / 3.0f);
+    }
+    if (guideAspect239) {
+        glColor4f(1.0f, 0.5f, 0.9f, 0.9f);
+        drawAspectGuide(2.39f);
+    }
+
+    if (guideEdgeBorder) {
+        glColor4f(1.0f, 1.0f, 1.0f, 0.95f);
+        glLineWidth(2.0f);
+        float inset = 2.0f / std::max(videoWinW, 1);
+        float insetY = 2.0f / std::max(videoWinH, 1);
+        drawGuideRect(-1.0f + inset, -1.0f + insetY, 1.0f - inset, 1.0f - insetY);
+        glLineWidth(1.0f);
+    }
+
+    if (guideCrosshair) {
+        glColor4f(1.0f, 0.2f, 0.2f, 0.95f);
+        glLineWidth(1.5f);
+        glBegin(GL_LINES);
+        glVertex2f(-1.0f, 0.0f); glVertex2f(1.0f, 0.0f);
+        glVertex2f(0.0f, -1.0f); glVertex2f(0.0f, 1.0f);
+        glEnd();
+        glLineWidth(1.0f);
+    }
+
+    glDisable(GL_BLEND);
+}
+
+void processCaptureFrame() {
+    if (isPaused) return;
+
+    double currentTime = glutGet(GLUT_ELAPSED_TIME) / 1000.0;
+    double deltaTime = currentTime - lastFrameTime;
+    lastFrameTime = currentTime;
+
+    if (fastForwardSpeed > 1.0f && videoDuration > 0.0) {
+        double targetTime = currentVideoTime + deltaTime * fastForwardSpeed;
+        if (targetTime > videoDuration && isLooping)
+            targetTime = fmod(targetTime, videoDuration);
+        seekVideo(std::min(videoDuration, targetTime));
+    }
+
+    cv::Mat frame;
+    cap >> frame;
+    if (!frame.empty()) {
+        currentVideoTime = cap.get(cv::CAP_PROP_POS_MSEC) / 1000.0;
+        for (auto& filter : filters)
+            frame = filter->apply(frame);
+        cv::flip(frame, frame, 0);
+        latestFrame = frame;
+    } else {
+        if (isLooping) {
+            cap.set(cv::CAP_PROP_POS_FRAMES, 0);
+        } else if (!playlist.empty()) {
+            currentVideoIndex = (currentVideoIndex + 1) % playlist.size();
+            openVideoSource(playlist[currentVideoIndex]);
+            if (cap.isOpened()) {
+                double fps = cap.get(cv::CAP_PROP_FPS);
+                double frames = cap.get(cv::CAP_PROP_FRAME_COUNT);
+                videoDuration = (fps > 1e-3 && frames > 0) ? frames / fps : 0.0;
+            }
+        }
+    }
+}
+
+// Placement + guides panel (control window)
+void drawPlacementPanel() {
+    int sw = std::max(1, glutGet(GLUT_SCREEN_WIDTH));
+    int sh = std::max(1, glutGet(GLUT_SCREEN_HEIGHT));
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glColor4f(0.08f, 0.08f, 0.12f, 0.82f);
+    glBegin(GL_QUADS);
+    glVertex2f(PLACE_PANEL_X, PLACE_PANEL_Y - 0.42f);
+    glVertex2f(PLACE_PANEL_X + 0.52f, PLACE_PANEL_Y - 0.42f);
+    glVertex2f(PLACE_PANEL_X + 0.52f, PLACE_PANEL_Y + 0.08f);
+    glVertex2f(PLACE_PANEL_X, PLACE_PANEL_Y + 0.08f);
+    glEnd();
+    glDisable(GL_BLEND);
+
+    glColor3f(1, 1, 1);
+    drawText(PLACE_PANEL_X + 0.02f, PLACE_PANEL_Y + 0.04f, "Video Window Placement", GLUT_BITMAP_HELVETICA_12);
+
+    float xN = std::max(0.0f, std::min(1.0f, videoWinX / float(std::max(1, sw - videoWinW))));
+    float yN = std::max(0.0f, std::min(1.0f, videoWinY / float(std::max(1, sh - videoWinH))));
+    float wN = std::max(0.0f, std::min(1.0f, (videoWinW - VIDEO_MIN_W) / float(std::max(1, sw - VIDEO_MIN_W))));
+    float hN = std::max(0.0f, std::min(1.0f, (videoWinH - VIDEO_MIN_H) / float(std::max(1, sh - VIDEO_MIN_H))));
+
+    drawSlider(PLACE_PANEL_X + 0.02f, PLACE_PANEL_Y - 0.04f, 0.22f, 0.025f, xN, "Win X");
+    drawSlider(PLACE_PANEL_X + 0.28f, PLACE_PANEL_Y - 0.04f, 0.22f, 0.025f, yN, "Win Y");
+    drawSlider(PLACE_PANEL_X + 0.02f, PLACE_PANEL_Y - 0.14f, 0.22f, 0.025f, wN, "Win W");
+    drawSlider(PLACE_PANEL_X + 0.28f, PLACE_PANEL_Y - 0.14f, 0.22f, 0.025f, hN, "Win H");
+
+    drawButton(PLACE_PANEL_X + 0.02f, PLACE_PANEL_Y - 0.24f, 0.10f, 0.05f, "Apply");
+    drawButton(PLACE_PANEL_X + 0.14f, PLACE_PANEL_Y - 0.24f, 0.10f, 0.05f, "Center");
+    drawButton(PLACE_PANEL_X + 0.26f, PLACE_PANEL_Y - 0.24f, 0.10f, 0.05f, "L Half");
+    drawButton(PLACE_PANEL_X + 0.38f, PLACE_PANEL_Y - 0.24f, 0.10f, 0.05f, "R Half");
+    drawButton(PLACE_PANEL_X + 0.02f, PLACE_PANEL_Y - 0.32f, 0.10f, 0.05f, "TL");
+    drawButton(PLACE_PANEL_X + 0.14f, PLACE_PANEL_Y - 0.32f, 0.10f, 0.05f, "TR");
+    drawButton(PLACE_PANEL_X + 0.26f, PLACE_PANEL_Y - 0.32f, 0.10f, 0.05f, "BL");
+    drawButton(PLACE_PANEL_X + 0.38f, PLACE_PANEL_Y - 0.32f, 0.10f, 0.05f, "BR");
+    drawButton(PLACE_PANEL_X + 0.02f, PLACE_PANEL_Y - 0.40f, 0.115f, 0.055f, "Vid FS", false, videoFullscreen);
+    drawButton(PLACE_PANEL_X + 0.145f, PLACE_PANEL_Y - 0.40f, 0.115f, 0.055f, "Vid Win");
+    drawButton(PLACE_PANEL_X + 0.27f, PLACE_PANEL_Y - 0.40f, 0.115f, 0.055f, "Ctl FS", false, controlFullscreen);
+    drawButton(PLACE_PANEL_X + 0.395f, PLACE_PANEL_Y - 0.40f, 0.115f, 0.055f, "Ctl Win");
+}
+
+bool hitTestPlacementPanel(float fx, float fy) {
+    int sw = std::max(1, glutGet(GLUT_SCREEN_WIDTH));
+    int sh = std::max(1, glutGet(GLUT_SCREEN_HEIGHT));
+
+    auto setPlace = [&](int which, float norm) {
+        norm = std::max(0.0f, std::min(1.0f, norm));
+        activePlaceSlider = which;
+        if (which == 0) videoWinX = int(norm * std::max(1, sw - videoWinW));
+        else if (which == 1) videoWinY = int(norm * std::max(1, sh - videoWinH));
+        else if (which == 2) videoWinW = VIDEO_MIN_W + int(norm * std::max(1, sw - VIDEO_MIN_W));
+        else if (which == 3) videoWinH = VIDEO_MIN_H + int(norm * std::max(1, sh - VIDEO_MIN_H));
+    };
+
+    if (isInside(fx, fy, PLACE_PANEL_X + 0.02f, PLACE_PANEL_Y - 0.04f, 0.22f, 0.025f)) {
+        setPlace(0, (fx - (PLACE_PANEL_X + 0.02f)) / 0.22f); return true;
+    }
+    if (isInside(fx, fy, PLACE_PANEL_X + 0.28f, PLACE_PANEL_Y - 0.04f, 0.22f, 0.025f)) {
+        setPlace(1, (fx - (PLACE_PANEL_X + 0.28f)) / 0.22f); return true;
+    }
+    if (isInside(fx, fy, PLACE_PANEL_X + 0.02f, PLACE_PANEL_Y - 0.14f, 0.22f, 0.025f)) {
+        setPlace(2, (fx - (PLACE_PANEL_X + 0.02f)) / 0.22f); return true;
+    }
+    if (isInside(fx, fy, PLACE_PANEL_X + 0.28f, PLACE_PANEL_Y - 0.14f, 0.22f, 0.025f)) {
+        setPlace(3, (fx - (PLACE_PANEL_X + 0.28f)) / 0.22f); return true;
+    }
+    if (isInside(fx, fy, PLACE_PANEL_X + 0.02f, PLACE_PANEL_Y - 0.24f, 0.10f, 0.05f)) { applyVideoGeometry(); return true; }
+    if (isInside(fx, fy, PLACE_PANEL_X + 0.14f, PLACE_PANEL_Y - 0.24f, 0.10f, 0.05f)) { placeVideoPreset("center"); return true; }
+    if (isInside(fx, fy, PLACE_PANEL_X + 0.26f, PLACE_PANEL_Y - 0.24f, 0.10f, 0.05f)) { placeVideoPreset("lefthalf"); return true; }
+    if (isInside(fx, fy, PLACE_PANEL_X + 0.38f, PLACE_PANEL_Y - 0.24f, 0.10f, 0.05f)) { placeVideoPreset("righthalf"); return true; }
+    if (isInside(fx, fy, PLACE_PANEL_X + 0.02f, PLACE_PANEL_Y - 0.32f, 0.10f, 0.05f)) { placeVideoPreset("topleft"); return true; }
+    if (isInside(fx, fy, PLACE_PANEL_X + 0.14f, PLACE_PANEL_Y - 0.32f, 0.10f, 0.05f)) { placeVideoPreset("topright"); return true; }
+    if (isInside(fx, fy, PLACE_PANEL_X + 0.26f, PLACE_PANEL_Y - 0.32f, 0.10f, 0.05f)) { placeVideoPreset("bottomleft"); return true; }
+    if (isInside(fx, fy, PLACE_PANEL_X + 0.38f, PLACE_PANEL_Y - 0.32f, 0.10f, 0.05f)) { placeVideoPreset("bottomright"); return true; }
+    if (isInside(fx, fy, PLACE_PANEL_X + 0.02f, PLACE_PANEL_Y - 0.40f, 0.115f, 0.055f)) {
+        setVideoFullscreen(true);
+        return true;
+    }
+    if (isInside(fx, fy, PLACE_PANEL_X + 0.145f, PLACE_PANEL_Y - 0.40f, 0.115f, 0.055f)) {
+        setVideoFullscreen(false);
+        return true;
+    }
+    if (isInside(fx, fy, PLACE_PANEL_X + 0.27f, PLACE_PANEL_Y - 0.40f, 0.115f, 0.055f)) {
+        setControlFullscreen(true);
+        return true;
+    }
+    if (isInside(fx, fy, PLACE_PANEL_X + 0.395f, PLACE_PANEL_Y - 0.40f, 0.115f, 0.055f)) {
+        setControlFullscreen(false);
+        return true;
+    }
+    return false;
+}
+
+void drawGuidesPanel() {
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glColor4f(0.08f, 0.08f, 0.12f, 0.82f);
+    glBegin(GL_QUADS);
+    glVertex2f(GUIDE_PANEL_X, GUIDE_PANEL_Y - 0.30f);
+    glVertex2f(GUIDE_PANEL_X + 0.52f, GUIDE_PANEL_Y - 0.30f);
+    glVertex2f(GUIDE_PANEL_X + 0.52f, GUIDE_PANEL_Y + 0.08f);
+    glVertex2f(GUIDE_PANEL_X, GUIDE_PANEL_Y + 0.08f);
+    glEnd();
+    glDisable(GL_BLEND);
+
+    glColor3f(1, 1, 1);
+    drawText(GUIDE_PANEL_X + 0.02f, GUIDE_PANEL_Y + 0.04f, "Calibration Guides", GLUT_BITMAP_HELVETICA_12);
+
+    auto tog = [&](float x, float y, bool on, const char* label) {
+        drawButton(x, y, 0.15f, 0.045f, label, false, on);
+    };
+    tog(GUIDE_PANEL_X + 0.02f, GUIDE_PANEL_Y - 0.04f, guideCrosshair, "Cross");
+    tog(GUIDE_PANEL_X + 0.19f, GUIDE_PANEL_Y - 0.04f, guideEdgeBorder, "Edge");
+    tog(GUIDE_PANEL_X + 0.36f, GUIDE_PANEL_Y - 0.04f, guideThirds, "Thirds");
+    tog(GUIDE_PANEL_X + 0.02f, GUIDE_PANEL_Y - 0.11f, guideGrid, "Grid");
+    tog(GUIDE_PANEL_X + 0.19f, GUIDE_PANEL_Y - 0.11f, guideActionSafe, "Action");
+    tog(GUIDE_PANEL_X + 0.36f, GUIDE_PANEL_Y - 0.11f, guideTitleSafe, "Title");
+    tog(GUIDE_PANEL_X + 0.02f, GUIDE_PANEL_Y - 0.18f, guideAspect169, "16:9");
+    tog(GUIDE_PANEL_X + 0.19f, GUIDE_PANEL_Y - 0.18f, guideAspect43, "4:3");
+    tog(GUIDE_PANEL_X + 0.36f, GUIDE_PANEL_Y - 0.18f, guideAspect239, "2.39");
+    drawButton(GUIDE_PANEL_X + 0.02f, GUIDE_PANEL_Y - 0.27f, 0.22f, 0.05f, "Guides Off");
+    drawButton(GUIDE_PANEL_X + 0.28f, GUIDE_PANEL_Y - 0.27f, 0.22f, 0.05f, "Guides All");
+}
+
+bool hitTestGuidesPanel(float fx, float fy) {
+    auto hit = [&](float x, float y, bool& flag) {
+        if (isInside(fx, fy, x, y, 0.15f, 0.045f)) { flag = !flag; return true; }
+        return false;
+    };
+    if (hit(GUIDE_PANEL_X + 0.02f, GUIDE_PANEL_Y - 0.04f, guideCrosshair)) return true;
+    if (hit(GUIDE_PANEL_X + 0.19f, GUIDE_PANEL_Y - 0.04f, guideEdgeBorder)) return true;
+    if (hit(GUIDE_PANEL_X + 0.36f, GUIDE_PANEL_Y - 0.04f, guideThirds)) return true;
+    if (hit(GUIDE_PANEL_X + 0.02f, GUIDE_PANEL_Y - 0.11f, guideGrid)) return true;
+    if (hit(GUIDE_PANEL_X + 0.19f, GUIDE_PANEL_Y - 0.11f, guideActionSafe)) return true;
+    if (hit(GUIDE_PANEL_X + 0.36f, GUIDE_PANEL_Y - 0.11f, guideTitleSafe)) return true;
+    if (hit(GUIDE_PANEL_X + 0.02f, GUIDE_PANEL_Y - 0.18f, guideAspect169)) return true;
+    if (hit(GUIDE_PANEL_X + 0.19f, GUIDE_PANEL_Y - 0.18f, guideAspect43)) return true;
+    if (hit(GUIDE_PANEL_X + 0.36f, GUIDE_PANEL_Y - 0.18f, guideAspect239)) return true;
+    if (isInside(fx, fy, GUIDE_PANEL_X + 0.02f, GUIDE_PANEL_Y - 0.27f, 0.22f, 0.05f)) {
+        guideCrosshair = guideEdgeBorder = guideThirds = guideGrid = false;
+        guideActionSafe = guideTitleSafe = guideAspect169 = guideAspect43 = guideAspect239 = false;
+        return true;
+    }
+    if (isInside(fx, fy, GUIDE_PANEL_X + 0.28f, GUIDE_PANEL_Y - 0.27f, 0.22f, 0.05f)) {
+        guideCrosshair = guideEdgeBorder = guideThirds = guideGrid = true;
+        guideActionSafe = guideTitleSafe = guideAspect169 = guideAspect43 = guideAspect239 = true;
+        return true;
+    }
+    return false;
+}
+
+void displayVideoWindow() {
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    if (!latestFrame.empty())
+        displayVideoFrame(latestFrame);
+    drawCalibrationGuides();
+    glutSwapBuffers();
+}
+
+void displayControlWindow() {
     glClearColor(bgColor.r, bgColor.g, bgColor.b, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
-    // Draw video frame if available
-    if (frameAvailable) {
-        if (!isPaused) {
-            double currentTime = glutGet(GLUT_ELAPSED_TIME) / 1000.0;
-            double deltaTime = currentTime - lastFrameTime;
-            lastFrameTime = currentTime;
-
-            // Apply fast forward speed
-            if (fastForwardSpeed > 1.0f) {
-                double targetTime = currentVideoTime + deltaTime * fastForwardSpeed;
-                if (targetTime > videoDuration && isLooping) {
-                    targetTime = fmod(targetTime, videoDuration);
-                }
-                seekVideo(std::min(videoDuration, targetTime));
-            }
-
-            cv::Mat frame;
-            cap >> frame;
-            if (!frame.empty()) {
-                currentVideoTime = cap.get(cv::CAP_PROP_POS_MSEC) / 1000.0;
-                
-                for (auto& filter : filters)
-                    frame = filter->apply(frame);
-
-                cv::flip(frame, frame, 0); // Flip vertically for OpenGL
-                latestFrame = frame;
-                displayVideoFrame(frame);
-            } else {
-                if (isLooping) {
-                    cap.set(cv::CAP_PROP_POS_FRAMES, 0);
-                } else {
-                    currentVideoIndex = (currentVideoIndex + 1) % playlist.size();
-                    openVideoSource(playlist[currentVideoIndex]);
-                    if (cap.isOpened()) {
-                        videoDuration = cap.get(cv::CAP_PROP_FRAME_COUNT) / cap.get(cv::CAP_PROP_FPS);
-                    }
-                }
-            }
-        } else {
-            displayVideoFrame(latestFrame);
-        }
-        frameAvailable = false;
-    }
-
-    // Draw UI
     if (showUI) {
-        // Progress bar
         float progress = videoDuration > 0 ? currentVideoTime / videoDuration : 0;
         drawProgressBar(-0.95f, -0.95f, 1.9f, 0.03f * uiScale, progress);
 
-        // Time display
         std::ostringstream timeText;
         timeText << std::fixed << std::setprecision(1) << currentVideoTime << " / " << videoDuration << "s";
-        if (fastForwardSpeed > 1.0f) {
+        if (fastForwardSpeed > 1.0f)
             timeText << " (" << fastForwardSpeed << "x)";
-        }
         drawText(-0.95f, -0.9f, timeText.str());
 
-        // Main controls
         drawButton(-0.95f, -0.85f, 0.15f * uiScale, 0.08f * uiScale, isPaused ? ">" : "||");
         drawButton(-0.75f, -0.85f, 0.15f * uiScale, 0.08f * uiScale, "<<");
         drawButton(-0.55f, -0.85f, 0.15f * uiScale, 0.08f * uiScale, ">>");
@@ -1967,49 +2412,163 @@ void display() {
         drawButton(-0.15f, -0.85f, 0.15f * uiScale, 0.08f * uiScale, "Next");
         drawButton(0.05f, -0.85f, 0.15f * uiScale, 0.08f * uiScale, "Open");
         drawButton(0.25f, -0.85f, 0.15f * uiScale, 0.08f * uiScale, "Cam");
-        drawButton(0.8f, -0.85f, 0.15f * uiScale, 0.08f * uiScale, fullscreen ? "FullScreen" : "Windowed");
+        drawButton(0.45f, -0.85f, 0.14f * uiScale, 0.08f * uiScale, "Vid FS", false, videoFullscreen);
+        drawButton(0.62f, -0.85f, 0.14f * uiScale, 0.08f * uiScale, "Ctl FS", false, controlFullscreen);
 
-        // Filter controls (toggles only — sliders live in the left Active Effects panel)
         for (size_t i = 0; i < filters.size(); ++i) {
             float bx = 0.6f * uiScale;
             float by = -0.8f * uiScale + 0.15f * uiScale * i;
-            
-            std::string label = std::to_string(i+1) + ". " + filters[i]->name() + (filters[i]->enabled ? " [ON]" : " [OFF]");
+            std::string label = std::to_string(i + 1) + ". " + filters[i]->name() + (filters[i]->enabled ? " [ON]" : " [OFF]");
             drawButton(bx, by, 0.35f * uiScale, 0.08f * uiScale, label, false, filters[i]->enabled);
         }
 
-        drawActiveEffectsPanel();
         drawViewControls();
+        drawPlacementPanel();
+        drawGuidesPanel();
+        drawActiveEffectsPanel();
 
-        // Help text
-        drawText(-0.95f, 0.95f, "Space: Play/Pause | L: Loop | N: Next | F: Fullscreen | U: Toggle UI | 1-9: Filters");
-        drawText(-0.95f, 0.9f, "V: Open video | C: Cameras | Right-click: Pie | WASD/O/P/R: View | [/]: Speed");
+        drawText(-0.95f, 0.95f, "F: Video fullscreen | H: Control fullscreen | V Open | C Cam");
+        drawText(-0.95f, 0.90f, "Drag video window edges to resize, center to move | Guides + Placement on left");
     }
 
     drawPieMenu();
     drawSourceMenu();
-
     glutSwapBuffers();
 }
 
-void reshape(int w, int h) {
-    // GLUT can report 0 during interactive resize; never allow zero-sized GL state.
+void reshapeVideo(int w, int h) {
+    videoWinW = std::max(1, w);
+    videoWinH = std::max(1, h);
+    if (!videoFullscreen) {
+        videoWinX = glutGet(GLUT_WINDOW_X);
+        videoWinY = glutGet(GLUT_WINDOW_Y);
+    }
+    glViewport(0, 0, videoWinW, videoWinH);
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    gluOrtho2D(-1.0, 1.0, -1.0, 1.0);
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+}
+
+void reshapeControl(int w, int h) {
     windowWidth = std::max(1, w);
     windowHeight = std::max(1, h);
+    controlWinW = windowWidth;
+    controlWinH = windowHeight;
     glViewport(0, 0, windowWidth, windowHeight);
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
     gluOrtho2D(-1.0, 1.0, -1.0, 1.0);
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
-    
-    // Adjust UI scale based on window size
     uiScale = std::min(1.0f, std::max(0.7f, std::min(windowWidth / 800.0f, windowHeight / 600.0f)));
 }
 
 void idle() {
-    frameAvailable = true;
-    glutPostRedisplay();
+    processCaptureFrame();
+    postRedisplayBoth();
+}
+
+VideoDragMode hitVideoDragMode(int x, int y) {
+    bool left = x <= VIDEO_DRAG_EDGE;
+    bool right = x >= videoWinW - VIDEO_DRAG_EDGE;
+    bool bottom = y >= videoWinH - VIDEO_DRAG_EDGE; // GLUT y grows downward
+    bool top = y <= VIDEO_DRAG_EDGE;
+    if (top && left) return VideoDragMode::ResizeNW;
+    if (top && right) return VideoDragMode::ResizeNE;
+    if (bottom && left) return VideoDragMode::ResizeSW;
+    if (bottom && right) return VideoDragMode::ResizeSE;
+    if (left) return VideoDragMode::ResizeW;
+    if (right) return VideoDragMode::ResizeE;
+    if (top) return VideoDragMode::ResizeN;
+    if (bottom) return VideoDragMode::ResizeS;
+    return VideoDragMode::Move;
+}
+
+void mouseVideo(int button, int state, int x, int y) {
+    if (button == GLUT_LEFT_BUTTON) {
+        if (state == GLUT_DOWN) {
+            if (videoFullscreen) return;
+            syncVideoGeomFromWindow();
+            videoDragMode = hitVideoDragMode(x, y);
+            dragStartScreenX = videoWinX + x;
+            dragStartScreenY = videoWinY + y;
+            dragGeomX = videoWinX;
+            dragGeomY = videoWinY;
+            dragGeomW = videoWinW;
+            dragGeomH = videoWinH;
+        } else {
+            videoDragMode = VideoDragMode::None;
+            syncVideoGeomFromWindow();
+        }
+    } else if (button == GLUT_RIGHT_BUTTON && state == GLUT_DOWN) {
+        // right-click video toggles crosshair quickly
+        guideCrosshair = !guideCrosshair;
+    }
+}
+
+void motionVideo(int x, int y) {
+    if (videoDragMode == VideoDragMode::None || videoFullscreen) return;
+    int screenX = glutGet(GLUT_WINDOW_X) + x;
+    int screenY = glutGet(GLUT_WINDOW_Y) + y;
+    int dx = screenX - dragStartScreenX;
+    int dy = screenY - dragStartScreenY;
+
+    int nx = dragGeomX, ny = dragGeomY, nw = dragGeomW, nh = dragGeomH;
+    switch (videoDragMode) {
+        case VideoDragMode::Move:
+            nx = dragGeomX + dx; ny = dragGeomY + dy; break;
+        case VideoDragMode::ResizeE:
+            nw = std::max(VIDEO_MIN_W, dragGeomW + dx); break;
+        case VideoDragMode::ResizeW:
+            nw = std::max(VIDEO_MIN_W, dragGeomW - dx);
+            nx = dragGeomX + dragGeomW - nw; break;
+        case VideoDragMode::ResizeS:
+            nh = std::max(VIDEO_MIN_H, dragGeomH + dy); break;
+        case VideoDragMode::ResizeN:
+            nh = std::max(VIDEO_MIN_H, dragGeomH - dy);
+            ny = dragGeomY + dragGeomH - nh; break;
+        case VideoDragMode::ResizeSE:
+            nw = std::max(VIDEO_MIN_W, dragGeomW + dx);
+            nh = std::max(VIDEO_MIN_H, dragGeomH + dy); break;
+        case VideoDragMode::ResizeSW:
+            nw = std::max(VIDEO_MIN_W, dragGeomW - dx);
+            nx = dragGeomX + dragGeomW - nw;
+            nh = std::max(VIDEO_MIN_H, dragGeomH + dy); break;
+        case VideoDragMode::ResizeNE:
+            nw = std::max(VIDEO_MIN_W, dragGeomW + dx);
+            nh = std::max(VIDEO_MIN_H, dragGeomH - dy);
+            ny = dragGeomY + dragGeomH - nh; break;
+        case VideoDragMode::ResizeNW:
+            nw = std::max(VIDEO_MIN_W, dragGeomW - dx);
+            nx = dragGeomX + dragGeomW - nw;
+            nh = std::max(VIDEO_MIN_H, dragGeomH - dy);
+            ny = dragGeomY + dragGeomH - nh; break;
+        default: break;
+    }
+    videoWinX = nx; videoWinY = ny; videoWinW = nw; videoWinH = nh;
+    glutPositionWindow(videoWinX, videoWinY);
+    glutReshapeWindow(videoWinW, videoWinH);
+}
+
+void keyboardVideo(unsigned char key, int, int) {
+    switch (key) {
+        case 27:
+            if (videoFullscreen) setVideoFullscreen(false);
+            else exit(0);
+            break;
+        case 'f': case 'F':
+            setVideoFullscreen(!videoFullscreen);
+            break;
+        case ' ':
+            isPaused = !isPaused;
+            break;
+        case 'g': case 'G':
+            guideCrosshair = !guideCrosshair;
+            guideEdgeBorder = guideCrosshair;
+            break;
+    }
 }
 
 void updateVideoTime() {
@@ -2019,19 +2578,112 @@ void updateVideoTime() {
 }
 
 int main(int argc, char** argv) {
-    // Parse command line arguments
+    auto parseIntArg = [](const std::string& s, int& out) -> bool {
+        try { out = std::stoi(s); return true; } catch (...) { return false; }
+    };
+    auto parseGeometry = [&](const std::string& g, int& w, int& h, int& x, int& y) -> bool {
+        // WxH+X+Y or WxH-X-Y
+        int W=0,H=0,X=0,Y=0;
+        char c1=0,c2=0,c3=0;
+        if (sscanf(g.c_str(), "%d%c%d%c%d%c%d", &W, &c1, &H, &c2, &X, &c3, &Y) == 7) {
+            if ((c1=='x'||c1=='X') && (c2=='+'||c2=='-') && (c3=='+'||c3=='-')) {
+                if (c2=='-') X = -X;
+                if (c3=='-') Y = -Y;
+                w=W; h=H; x=X; y=Y;
+                return true;
+            }
+        }
+        if (sscanf(g.c_str(), "%d%c%d", &W, &c1, &H) == 3 && (c1=='x'||c1=='X')) {
+            w=W; h=H; return true;
+        }
+        return false;
+    };
+    auto enableGuidesList = [&](const std::string& list) {
+        auto enableOne = [&](const std::string& g) {
+            if (g=="cross"||g=="crosshair") guideCrosshair = true;
+            else if (g=="edge"||g=="border") guideEdgeBorder = true;
+            else if (g=="thirds") guideThirds = true;
+            else if (g=="grid") guideGrid = true;
+            else if (g=="action"||g=="actionsafe") guideActionSafe = true;
+            else if (g=="title"||g=="titlesafe") guideTitleSafe = true;
+            else if (g=="16:9"||g=="169") guideAspect169 = true;
+            else if (g=="4:3"||g=="43") guideAspect43 = true;
+            else if (g=="2.39"||g=="239") guideAspect239 = true;
+            else if (g=="all") {
+                guideCrosshair = guideEdgeBorder = guideThirds = guideGrid = true;
+                guideActionSafe = guideTitleSafe = guideAspect169 = guideAspect43 = guideAspect239 = true;
+            }
+        };
+        if (list.empty() || list == "all") { enableOne("all"); return; }
+        std::stringstream ss(list);
+        std::string item;
+        while (std::getline(ss, item, ',')) {
+            while (!item.empty() && item.front()==' ') item.erase(item.begin());
+            while (!item.empty() && item.back()==' ') item.pop_back();
+            enableOne(item);
+        }
+    };
+
     std::unordered_set<std::string> enabled;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
+        auto needVal = [&](int& dst, bool& flag) {
+            if (i + 1 < argc && parseIntArg(argv[i + 1], dst)) {
+                ++i; flag = true; return true;
+            }
+            return false;
+        };
         if (arg.rfind("--enable-", 0) == 0)
             enabled.insert(arg.substr(9));
         else if (arg == "--no-ui")
             showUI = false;
         else if (arg == "--fullscreen")
-            fullscreen = true;
-        else
+            videoFullscreen = true;
+        else if (arg == "--control-fullscreen")
+            controlFullscreen = true;
+        else if (arg == "--video-x" && needVal(videoWinX, videoGeomFromArgs)) {}
+        else if (arg == "--video-y" && needVal(videoWinY, videoGeomFromArgs)) {}
+        else if (arg == "--video-w" && needVal(videoWinW, videoGeomFromArgs)) {}
+        else if (arg == "--video-h" && needVal(videoWinH, videoGeomFromArgs)) {}
+        else if (arg == "--control-x" && needVal(controlWinX, controlGeomFromArgs)) {}
+        else if (arg == "--control-y" && needVal(controlWinY, controlGeomFromArgs)) {}
+        else if (arg == "--control-w" && needVal(controlWinW, controlGeomFromArgs)) {}
+        else if (arg == "--control-h" && needVal(controlWinH, controlGeomFromArgs)) {}
+        else if (arg.rfind("--video-geometry=", 0) == 0) {
+            if (parseGeometry(arg.substr(17), videoWinW, videoWinH, videoWinX, videoWinY))
+                videoGeomFromArgs = true;
+        } else if (arg == "--video-geometry" && i + 1 < argc) {
+            if (parseGeometry(argv[++i], videoWinW, videoWinH, videoWinX, videoWinY))
+                videoGeomFromArgs = true;
+        } else if (arg.rfind("--control-geometry=", 0) == 0) {
+            if (parseGeometry(arg.substr(19), controlWinW, controlWinH, controlWinX, controlWinY))
+                controlGeomFromArgs = true;
+        } else if (arg == "--control-geometry" && i + 1 < argc) {
+            if (parseGeometry(argv[++i], controlWinW, controlWinH, controlWinX, controlWinY))
+                controlGeomFromArgs = true;
+        } else if (arg == "--guides") {
+            enableGuidesList("all");
+        } else if (arg.rfind("--guides=", 0) == 0) {
+            enableGuidesList(arg.substr(9));
+        } else if (arg == "--preset" && i + 1 < argc) {
+            // applied after GLUT init
+            playlist.push_back(std::string("__preset__") + argv[++i]);
+        } else if (arg.rfind("--", 0) == 0) {
+            std::cerr << "Unknown option: " << arg << std::endl;
+        } else
             playlist.push_back(arg);
     }
+
+    // Extract delayed preset token if present
+    std::string startupPreset;
+    playlist.erase(std::remove_if(playlist.begin(), playlist.end(), [&](const std::string& s) {
+        if (s.rfind("__preset__", 0) == 0) {
+            startupPreset = s.substr(10);
+            return true;
+        }
+        return false;
+    }), playlist.end());
+
     if (playlist.empty()) playlist.push_back("0");
 
     // Initialize video capture
@@ -2041,8 +2693,11 @@ int main(int argc, char** argv) {
     }
 
     // Get video duration
-    videoDuration = cap.get(cv::CAP_PROP_FRAME_COUNT) / cap.get(cv::CAP_PROP_FPS);
-    lastFrameTime = glutGet(GLUT_ELAPSED_TIME) / 1000.0;
+    {
+        double fps = cap.get(cv::CAP_PROP_FPS);
+        double frames = cap.get(cv::CAP_PROP_FRAME_COUNT);
+        videoDuration = (fps > 1e-3 && frames > 0) ? frames / fps : 0.0;
+    }
 
     // Initialize filters
     auto anaglyph = std::make_unique<Anaglyph3DFilter>();
@@ -2109,27 +2764,56 @@ int main(int argc, char** argv) {
     colorize->enabled = enabled.count("colorize");
     filters.push_back(std::move(colorize));
 
+
     // Initialize GLUT
     glutInit(&argc, argv);
     glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB);
-    glutInitWindowSize(windowWidth, windowHeight);
-    glutCreateWindow("Enceladus Video Patcher - Lumpology");
-    
-    if (fullscreen) {
-        glutFullScreen();
+    glutSetOption(GLUT_ACTION_ON_WINDOW_CLOSE, GLUT_ACTION_CONTINUE_EXECUTION);
+
+    // Video window (stream + guides only)
+    glutInitWindowSize(std::max(VIDEO_MIN_W, videoWinW), std::max(VIDEO_MIN_H, videoWinH));
+    glutInitWindowPosition(videoWinX, videoWinY);
+    videoWindowId = glutCreateWindow("Enceladus Video");
+    glutDisplayFunc(displayVideoWindow);
+    glutReshapeFunc(reshapeVideo);
+    glutMouseFunc(mouseVideo);
+    glutMotionFunc(motionVideo);
+    glutKeyboardFunc(keyboardVideo);
+
+    // Control panel window
+    if (showUI) {
+        windowWidth = controlWinW;
+        windowHeight = controlWinH;
+        glutInitWindowSize(controlWinW, controlWinH);
+        glutInitWindowPosition(controlWinX, controlWinY);
+        controlWindowId = glutCreateWindow("Enceladus Control Panel");
+        glutDisplayFunc(displayControlWindow);
+        glutReshapeFunc(reshapeControl);
+        glutMouseFunc(mouse);
+        glutMotionFunc(mouseMotion);
+        glutPassiveMotionFunc(passiveMouseMotion);
+        glutKeyboardFunc(keyboard);
     }
 
-    // Set callbacks
-    glutDisplayFunc(display);
     glutIdleFunc(idle);
-    glutReshapeFunc(reshape);
-    glutMouseFunc(mouse);
-    glutMotionFunc(mouseMotion);
-    glutPassiveMotionFunc(passiveMouseMotion);
-    glutKeyboardFunc(keyboard);
+    lastFrameTime = glutGet(GLUT_ELAPSED_TIME) / 1000.0;
 
-    // Main loop
+    if (!startupPreset.empty())
+        placeVideoPreset(startupPreset);
+    else if (videoGeomFromArgs || !videoFullscreen)
+        applyVideoGeometry();
+
+    if (videoFullscreen)
+        setVideoFullscreen(true);
+
+    if (controlWindowId) {
+        glutSetWindow(controlWindowId);
+        glutPositionWindow(controlWinX, controlWinY);
+        glutReshapeWindow(controlWinW, controlWinH);
+        if (controlFullscreen)
+            setControlFullscreen(true);
+    }
+
     glutMainLoop();
-
     return 0;
 }
