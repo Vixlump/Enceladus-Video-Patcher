@@ -14,6 +14,8 @@
 #include <iomanip>
 #include <cmath>
 #include <random>
+#include <algorithm>
+#include <cctype>
 
 // Global variables
 cv::Mat latestFrame;
@@ -40,7 +42,17 @@ const float MAX_FF_SPEED = 16.0f;
 bool showPieMenu = false;
 float pieMenuCenterX = 0, pieMenuCenterY = 0;
 int selectedFilterIndex = -1;
-const float PIE_MENU_RADIUS = 0.3f;
+int pieHoverIndex = -1;
+const float PIE_MENU_RADIUS = 0.40f;
+const float PIE_MENU_INNER = 0.10f;
+
+// Video placement within the window (1.0 = fit, offsets are normalized -1..1)
+float videoScale = 1.0f;
+float videoOffsetX = 0.0f;
+float videoOffsetY = 0.0f;
+int activeViewSlider = -1; // 0=scale, 1=posX, 2=posY
+const float VIDEO_SCALE_MIN = 0.2f;
+const float VIDEO_SCALE_MAX = 2.0f;
 
 // Colors
 struct Color {
@@ -621,6 +633,20 @@ public:
 std::vector<std::unique_ptr<VideoFilter>> filters;
 cv::VideoCapture cap;
 
+// Open a playlist entry: numeric strings are camera indices (not GStreamer pipelines).
+bool openVideoSource(const std::string& source) {
+    bool isCamera = !source.empty() &&
+        std::all_of(source.begin(), source.end(),
+                    [](unsigned char c) { return std::isdigit(c); });
+    if (isCamera) {
+        int index = std::stoi(source);
+        // Prefer V4L2 on Linux so "0" is not parsed as a GStreamer bin.
+        if (cap.open(index, cv::CAP_V4L2)) return true;
+        return cap.open(index, cv::CAP_ANY);
+    }
+    return cap.open(source);
+}
+
 // Utility functions
 void drawText(float x, float y, const std::string& text, void* font = GLUT_BITMAP_HELVETICA_12) {
     glRasterPos2f(x, y);
@@ -648,6 +674,136 @@ void drawButton(float x, float y, float w, float h, const std::string& label, bo
     float textX = x + w/2 - (label.length() * 0.01f * uiScale);
     float textY = y + h/2 - 0.015f * uiScale;
     drawText(textX, textY, label);
+}
+
+void drawSlider(float x, float y, float w, float h, float value, const std::string& label);
+bool isInside(float mx, float my, float x, float y, float w, float h);
+
+// Active-effects panel sits on the left so sliders never overlap the filter buttons.
+const float AE_PANEL_X = -0.95f;
+const float AE_PANEL_W = 0.48f;
+const float AE_CONTENT_X = -0.93f;
+const float AE_SLIDER_W = 0.42f;
+const float AE_SLIDER_H = 0.025f;
+const float AE_TOP_Y = 0.78f;
+const float AE_TITLE_STEP = 0.06f;
+const float AE_NAME_STEP = 0.05f;
+const float AE_SLIDER_STEP = 0.07f;
+const float AE_FILTER_GAP = 0.035f;
+const float AE_BOTTOM_LIMIT = -0.72f;
+
+bool anyFilterEnabled() {
+    for (const auto& filter : filters) {
+        if (filter->enabled) return true;
+    }
+    return false;
+}
+
+float activeEffectsContentHeight() {
+    float h = AE_TITLE_STEP;
+    for (const auto& filter : filters) {
+        if (!filter->enabled) continue;
+        h += AE_NAME_STEP;
+        if (filter->hasStrength()) h += AE_SLIDER_STEP;
+        if (filter->hasParam1()) h += AE_SLIDER_STEP;
+        if (filter->hasParam2()) h += AE_SLIDER_STEP;
+        h += AE_FILTER_GAP;
+    }
+    return h;
+}
+
+void drawActiveEffectsPanel() {
+    if (!anyFilterEnabled()) return;
+
+    const float contentH = activeEffectsContentHeight();
+    const float listY = std::max(AE_BOTTOM_LIMIT, AE_TOP_Y - contentH);
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glColor4f(0.08f, 0.08f, 0.12f, 0.82f);
+    glBegin(GL_QUADS);
+    glVertex2f(AE_PANEL_X, listY);
+    glVertex2f(AE_PANEL_X + AE_PANEL_W, listY);
+    glVertex2f(AE_PANEL_X + AE_PANEL_W, AE_TOP_Y);
+    glVertex2f(AE_PANEL_X, AE_TOP_Y);
+    glEnd();
+
+    glColor4f(0.35f, 0.35f, 0.45f, 0.95f);
+    glLineWidth(1.5f);
+    glBegin(GL_LINE_LOOP);
+    glVertex2f(AE_PANEL_X, listY);
+    glVertex2f(AE_PANEL_X + AE_PANEL_W, listY);
+    glVertex2f(AE_PANEL_X + AE_PANEL_W, AE_TOP_Y);
+    glVertex2f(AE_PANEL_X, AE_TOP_Y);
+    glEnd();
+    glDisable(GL_BLEND);
+
+    glColor3f(1.0f, 1.0f, 1.0f);
+    drawText(AE_CONTENT_X, AE_TOP_Y - 0.04f, "Active Effects", GLUT_BITMAP_HELVETICA_18);
+
+    float currentY = AE_TOP_Y - AE_TITLE_STEP;
+    for (size_t i = 0; i < filters.size(); ++i) {
+        if (!filters[i]->enabled) continue;
+        if (currentY < listY + 0.04f) break;
+
+        glColor3f(0.85f, 0.85f, 1.0f);
+        drawText(AE_CONTENT_X, currentY, filters[i]->name(), GLUT_BITMAP_HELVETICA_12);
+        currentY -= AE_NAME_STEP;
+
+        if (filters[i]->hasStrength()) {
+            drawSlider(AE_CONTENT_X, currentY - AE_SLIDER_H, AE_SLIDER_W, AE_SLIDER_H,
+                       filters[i]->strength, "Strength");
+            currentY -= AE_SLIDER_STEP;
+        }
+        if (filters[i]->hasParam1()) {
+            drawSlider(AE_CONTENT_X, currentY - AE_SLIDER_H, AE_SLIDER_W, AE_SLIDER_H,
+                       filters[i]->param1, filters[i]->param1Name());
+            currentY -= AE_SLIDER_STEP;
+        }
+        if (filters[i]->hasParam2()) {
+            drawSlider(AE_CONTENT_X, currentY - AE_SLIDER_H, AE_SLIDER_W, AE_SLIDER_H,
+                       filters[i]->param2, filters[i]->param2Name());
+            currentY -= AE_SLIDER_STEP;
+        }
+        currentY -= AE_FILTER_GAP;
+    }
+}
+
+// Returns true if a slider was hit; sets activeSlider and updates the value.
+bool hitTestActiveEffectsSliders(float fx, float fy) {
+    if (!anyFilterEnabled()) return false;
+
+    const float contentH = activeEffectsContentHeight();
+    const float listY = std::max(AE_BOTTOM_LIMIT, AE_TOP_Y - contentH);
+    if (fx < AE_PANEL_X || fx > AE_PANEL_X + AE_PANEL_W ||
+        fy < listY || fy > AE_TOP_Y) {
+        return false;
+    }
+
+    float currentY = AE_TOP_Y - AE_TITLE_STEP;
+    for (size_t i = 0; i < filters.size(); ++i) {
+        if (!filters[i]->enabled) continue;
+
+        currentY -= AE_NAME_STEP;
+
+        auto trySlider = [&](int paramType, float& value) -> bool {
+            float sy = currentY - AE_SLIDER_H;
+            if (isInside(fx, fy, AE_CONTENT_X, sy, AE_SLIDER_W, AE_SLIDER_H)) {
+                activeSlider = static_cast<int>(i) * 3 + paramType;
+                value = std::max(0.0f, std::min(1.0f, (fx - AE_CONTENT_X) / AE_SLIDER_W));
+                return true;
+            }
+            currentY -= AE_SLIDER_STEP;
+            return false;
+        };
+
+        if (filters[i]->hasStrength() && trySlider(0, filters[i]->strength)) return true;
+        if (filters[i]->hasParam1() && trySlider(1, filters[i]->param1)) return true;
+        if (filters[i]->hasParam2() && trySlider(2, filters[i]->param2)) return true;
+
+        currentY -= AE_FILTER_GAP;
+    }
+    return false;
 }
 
 void drawSlider(float x, float y, float w, float h, float value, const std::string& label) {
@@ -708,193 +864,220 @@ void seekVideo(double position) {
     }
 }
 
+void updatePieHover(float fx, float fy) {
+    pieHoverIndex = -1;
+    if (!showPieMenu || filters.empty()) return;
+
+    float dx = fx - pieMenuCenterX;
+    float dy = fy - pieMenuCenterY;
+    float dist = std::sqrt(dx * dx + dy * dy);
+    if (dist > PIE_MENU_RADIUS || dist < PIE_MENU_INNER) return;
+
+    float angle = std::atan2(dy, dx);
+    if (angle < 0.0f) angle += 2.0f * M_PI;
+    int idx = static_cast<int>((angle / (2.0f * M_PI)) * filters.size());
+    if (idx >= 0 && idx < static_cast<int>(filters.size()))
+        pieHoverIndex = idx;
+}
+
 void drawPieMenu() {
     if (!showPieMenu || filters.empty()) return;
-    
-    const float sliceAngle = 2.0f * M_PI / filters.size();
-    const float iconSize = 0.05f * uiScale;
-    const float innerRadius = PIE_MENU_RADIUS * 0.3f;
-    const float textRadius = PIE_MENU_RADIUS * 0.7f;
-    const float outerRadius = PIE_MENU_RADIUS;
-    
-    // Draw background circle with subtle shadow
-    glColor4f(0.0f, 0.0f, 0.0f, 0.5f);
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    const size_t n = filters.size();
+    const float sliceAngle = 2.0f * M_PI / static_cast<float>(n);
+    const float outerR = PIE_MENU_RADIUS;
+    const float innerR = PIE_MENU_INNER;
+    const float labelR = (innerR + outerR) * 0.55f;
+    const float gap = sliceAngle * 0.04f;
+    const int arcSteps = std::max(4, static_cast<int>(48 / n) + 2);
+
+    // Dim the scene behind the menu
+    glColor4f(0.0f, 0.0f, 0.0f, 0.35f);
+    glBegin(GL_QUADS);
+    glVertex2f(-1.0f, -1.0f);
+    glVertex2f( 1.0f, -1.0f);
+    glVertex2f( 1.0f,  1.0f);
+    glVertex2f(-1.0f,  1.0f);
+    glEnd();
+
+    // Soft drop shadow
+    glColor4f(0.0f, 0.0f, 0.0f, 0.45f);
     glBegin(GL_TRIANGLE_FAN);
-    glVertex2f(pieMenuCenterX, pieMenuCenterY - 0.02f);
-    for (int i = 0; i <= 32; i++) {
-        float angle = i * 2.0f * M_PI / 32;
-        glVertex2f(pieMenuCenterX + outerRadius * cos(angle), 
-                  pieMenuCenterY + outerRadius * sin(angle) - 0.02f);
+    glVertex2f(pieMenuCenterX + 0.012f, pieMenuCenterY - 0.018f);
+    for (int i = 0; i <= 48; ++i) {
+        float a = i * 2.0f * M_PI / 48.0f;
+        glVertex2f(pieMenuCenterX + 0.012f + outerR * cos(a),
+                   pieMenuCenterY - 0.018f + outerR * sin(a));
     }
     glEnd();
-    
-    // Draw main pie menu background
-    glColor4f(0.15f, 0.15f, 0.2f, 0.9f);
-    glBegin(GL_TRIANGLE_FAN);
-    glVertex2f(pieMenuCenterX, pieMenuCenterY);
-    for (int i = 0; i <= 32; i++) {
-        float angle = i * 2.0f * M_PI / 32;
-        glVertex2f(pieMenuCenterX + outerRadius * cos(angle), 
-                  pieMenuCenterY + outerRadius * sin(angle));
-    }
-    glEnd();
-    
-    // Draw slices with highlight effect
-    for (size_t i = 0; i < filters.size(); ++i) {
-        float angle = i * sliceAngle;
-        float midAngle = angle + sliceAngle/2;
-        
-        // Draw slice with highlight if enabled
-        if (filters[i]->enabled) {
-            glColor4f(0.3f, 0.6f, 0.3f, 0.7f);
-        } else {
-            glColor4f(0.3f, 0.3f, 0.4f, 0.7f);
-        }
-        
-        glBegin(GL_TRIANGLE_FAN);
-        glVertex2f(pieMenuCenterX, pieMenuCenterY);
-        for (int j = 0; j <= 3; ++j) {
-            float a = angle + (j * sliceAngle / 3);
-            glVertex2f(pieMenuCenterX + outerRadius * cos(a), 
-                      pieMenuCenterY + outerRadius * sin(a));
-        }
-        glEnd();
-        
-        // Draw slice border
-        glColor4f(0.5f, 0.5f, 0.6f, 0.8f);
-        glLineWidth(1.5f);
-        glBegin(GL_LINE_STRIP);
-        glVertex2f(pieMenuCenterX, pieMenuCenterY);
-        glVertex2f(pieMenuCenterX + outerRadius * cos(angle), 
-                  pieMenuCenterY + outerRadius * sin(angle));
-        glVertex2f(pieMenuCenterX + outerRadius * cos(angle + sliceAngle), 
-                  pieMenuCenterY + outerRadius * sin(angle + sliceAngle));
-        glVertex2f(pieMenuCenterX, pieMenuCenterY);
-        glEnd();
-        
-        // Calculate text position
-        float textX = pieMenuCenterX + textRadius * cos(midAngle);
-        float textY = pieMenuCenterY + textRadius * sin(midAngle);
-        
-        // Draw filter number with outline
-        glColor3f(0.0f, 0.0f, 0.0f);
-        for (float dx = -0.002f; dx <= 0.002f; dx += 0.002f) {
-            for (float dy = -0.002f; dy <= 0.002f; dy += 0.002f) {
-                drawText(textX + dx - iconSize/2, textY + dy - iconSize/2, 
-                        std::to_string(i+1), GLUT_BITMAP_HELVETICA_18);
-            }
-        }
-        glColor3f(1.0f, 1.0f, 1.0f);
-        drawText(textX - iconSize/2, textY - iconSize/2, 
-                std::to_string(i+1), GLUT_BITMAP_HELVETICA_18);
-        
-        // Draw filter name with outline
-        float nameX = textX - (filters[i]->name().length() * 0.01f);
-        float nameY = textY - iconSize/2 - 0.05f;
-        
-        glColor3f(0.0f, 0.0f, 0.0f);
-        for (float dx = -0.0015f; dx <= 0.0015f; dx += 0.0015f) {
-            for (float dy = -0.0015f; dy <= 0.0015f; dy += 0.0015f) {
-                drawText(nameX + dx, nameY + dy, filters[i]->name());
-            }
-        }
-        glColor3f(1.0f, 1.0f, 1.0f);
-        drawText(nameX, nameY, filters[i]->name());
-    }
-    
-    // Draw center circle with highlight
-    glColor4f(0.4f, 0.4f, 0.5f, 1.0f);
+
+    // Outer ring background
+    glColor4f(0.12f, 0.12f, 0.16f, 0.92f);
     glBegin(GL_TRIANGLE_FAN);
     glVertex2f(pieMenuCenterX, pieMenuCenterY);
-    for (int i = 0; i <= 16; i++) {
-        float angle = i * 2.0f * M_PI / 16;
-        glVertex2f(pieMenuCenterX + innerRadius * cos(angle), 
-                  pieMenuCenterY + innerRadius * sin(angle));
+    for (int i = 0; i <= 48; ++i) {
+        float a = i * 2.0f * M_PI / 48.0f;
+        glVertex2f(pieMenuCenterX + outerR * cos(a),
+                   pieMenuCenterY + outerR * sin(a));
     }
     glEnd();
-    
-    // Draw active effects sliders list if any filters are enabled
-    bool anyEnabled = false;
-    for (const auto& filter : filters) {
-        if (filter->enabled) {
-            anyEnabled = true;
-            break;
+
+    for (size_t i = 0; i < n; ++i) {
+        float a0 = i * sliceAngle + gap * 0.5f;
+        float a1 = (i + 1) * sliceAngle - gap * 0.5f;
+        float mid = 0.5f * (a0 + a1);
+        bool hovered = (static_cast<int>(i) == pieHoverIndex);
+        bool enabled = filters[i]->enabled;
+
+        if (hovered)
+            glColor4f(0.35f, 0.55f, 0.85f, 0.95f);
+        else if (enabled)
+            glColor4f(0.22f, 0.55f, 0.30f, 0.90f);
+        else
+            glColor4f(0.28f, 0.28f, 0.34f, 0.88f);
+
+        glBegin(GL_TRIANGLE_STRIP);
+        for (int s = 0; s <= arcSteps; ++s) {
+            float t = static_cast<float>(s) / arcSteps;
+            float a = a0 + (a1 - a0) * t;
+            glVertex2f(pieMenuCenterX + outerR * cos(a), pieMenuCenterY + outerR * sin(a));
+            glVertex2f(pieMenuCenterX + innerR * cos(a), pieMenuCenterY + innerR * sin(a));
         }
-    }
-    
-    if (anyEnabled) {
-        const float sliderWidth = 0.3f;
-        const float sliderHeight = 0.03f;
-        const float sliderSpacing = 0.08f; // Increased spacing
-        const float listX = pieMenuCenterX - 0.55f; // Move further left
-        const float listY = pieMenuCenterY - 0.4f;
-        const float listWidth = 0.5f; // Wider to accommodate text
-        const float listHeight = 0.8f;
-        
-        // Draw list background with more transparency
-        glColor4f(0.1f, 0.1f, 0.15f, 0.7f);
-        glBegin(GL_QUADS);
-        glVertex2f(listX, listY);
-        glVertex2f(listX + listWidth, listY);
-        glVertex2f(listX + listWidth, listY + listHeight);
-        glVertex2f(listX, listY + listHeight);
         glEnd();
-        
-        // Draw list border
-        glColor4f(0.3f, 0.3f, 0.4f, 0.9f);
-        glLineWidth(2.0f);
-        glBegin(GL_LINE_LOOP);
-        glVertex2f(listX, listY);
-        glVertex2f(listX + listWidth, listY);
-        glVertex2f(listX + listWidth, listY + listHeight);
-        glVertex2f(listX, listY + listHeight);
+
+        glColor4f(0.55f, 0.55f, 0.62f, 0.55f);
+        glLineWidth(1.0f);
+        glBegin(GL_LINES);
+        glVertex2f(pieMenuCenterX + innerR * cos(a0), pieMenuCenterY + innerR * sin(a0));
+        glVertex2f(pieMenuCenterX + outerR * cos(a0), pieMenuCenterY + outerR * sin(a0));
         glEnd();
-        
-        // Draw title with larger font
+
+        float tx = pieMenuCenterX + labelR * cos(mid);
+        float ty = pieMenuCenterY + labelR * sin(mid);
+        std::string num = std::to_string(i + 1);
+        glColor3f(0.0f, 0.0f, 0.0f);
+        drawText(tx - 0.012f, ty - 0.012f, num, GLUT_BITMAP_HELVETICA_18);
         glColor3f(1.0f, 1.0f, 1.0f);
-        drawText(listX + 0.02f, listY + listHeight - 0.04f, "Active Effects:", GLUT_BITMAP_HELVETICA_18);
-        
-        // Draw sliders for each enabled filter
-        float currentY = listY + listHeight - 0.1f; // More initial space
-        for (size_t i = 0; i < filters.size(); ++i) {
-            if (!filters[i]->enabled) continue;
-            
-            // Filter name with larger font
-            glColor3f(0.8f, 0.8f, 1.0f);
-            drawText(listX + 0.02f, currentY, filters[i]->name(), GLUT_BITMAP_HELVETICA_18);
-            currentY -= 0.06f;
-            
-            // Strength slider
-            if (filters[i]->hasStrength()) {
-                drawSlider(listX + 0.02f, currentY - 0.02f, sliderWidth, sliderHeight, 
-                          filters[i]->strength, "Strength");
-                currentY -= sliderSpacing;
-            }
-            
-            // Param1 slider
-            if (filters[i]->hasParam1()) {
-                drawSlider(listX + 0.02f, currentY - 0.02f, sliderWidth, sliderHeight, 
-                          filters[i]->param1, filters[i]->param1Name());
-                currentY -= sliderSpacing;
-            }
-            
-            // Param2 slider
-            if (filters[i]->hasParam2()) {
-                drawSlider(listX + 0.02f, currentY - 0.02f, sliderWidth, sliderHeight, 
-                          filters[i]->param2, filters[i]->param2Name());
-                currentY -= sliderSpacing;
-            }
-            
-            currentY -= 0.04f; // Extra spacing between filters
-        }
+        drawText(tx - 0.01f, ty - 0.01f, num, GLUT_BITMAP_HELVETICA_18);
     }
+
+    // Center hub
+    glColor4f(0.18f, 0.18f, 0.22f, 0.98f);
+    glBegin(GL_TRIANGLE_FAN);
+    glVertex2f(pieMenuCenterX, pieMenuCenterY);
+    for (int i = 0; i <= 32; ++i) {
+        float a = i * 2.0f * M_PI / 32.0f;
+        glVertex2f(pieMenuCenterX + innerR * cos(a), pieMenuCenterY + innerR * sin(a));
+    }
+    glEnd();
+    glColor4f(0.55f, 0.55f, 0.65f, 1.0f);
+    glLineWidth(2.0f);
+    glBegin(GL_LINE_LOOP);
+    for (int i = 0; i <= 32; ++i) {
+        float a = i * 2.0f * M_PI / 32.0f;
+        glVertex2f(pieMenuCenterX + innerR * cos(a), pieMenuCenterY + innerR * sin(a));
+    }
+    glEnd();
+
+    std::string hubText = (pieHoverIndex >= 0 && pieHoverIndex < static_cast<int>(n))
+        ? filters[pieHoverIndex]->name()
+        : "Close";
+    if (pieHoverIndex >= 0 && pieHoverIndex < static_cast<int>(n) && filters[pieHoverIndex]->enabled)
+        hubText += " *";
+    float hubX = pieMenuCenterX - hubText.length() * 0.0065f;
+    glColor3f(0.95f, 0.95f, 0.98f);
+    drawText(hubX, pieMenuCenterY - 0.01f, hubText, GLUT_BITMAP_HELVETICA_12);
+
+    glDisable(GL_BLEND);
+}
+
+// View transform panel (scale / position)
+const float VIEW_PANEL_X = -0.48f;
+const float VIEW_PANEL_Y = -0.72f;
+const float VIEW_SLIDER_W = 0.22f;
+const float VIEW_SLIDER_H = 0.025f;
+const float VIEW_SLIDER_GAP = 0.28f;
+
+void drawViewControls() {
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glColor4f(0.08f, 0.08f, 0.12f, 0.75f);
+    glBegin(GL_QUADS);
+    glVertex2f(VIEW_PANEL_X - 0.02f, VIEW_PANEL_Y - 0.02f);
+    glVertex2f(VIEW_PANEL_X + 0.92f, VIEW_PANEL_Y - 0.02f);
+    glVertex2f(VIEW_PANEL_X + 0.92f, VIEW_PANEL_Y + 0.10f);
+    glVertex2f(VIEW_PANEL_X - 0.02f, VIEW_PANEL_Y + 0.10f);
+    glEnd();
+    glDisable(GL_BLEND);
+
+    float scaleNorm = (videoScale - VIDEO_SCALE_MIN) / (VIDEO_SCALE_MAX - VIDEO_SCALE_MIN);
+    float xNorm = (videoOffsetX + 1.0f) * 0.5f;
+    float yNorm = (videoOffsetY + 1.0f) * 0.5f;
+
+    drawSlider(VIEW_PANEL_X, VIEW_PANEL_Y, VIEW_SLIDER_W, VIEW_SLIDER_H, scaleNorm, "Scale");
+    drawSlider(VIEW_PANEL_X + VIEW_SLIDER_GAP, VIEW_PANEL_Y, VIEW_SLIDER_W, VIEW_SLIDER_H, xNorm, "Pos X");
+    drawSlider(VIEW_PANEL_X + VIEW_SLIDER_GAP * 2.0f, VIEW_PANEL_Y, VIEW_SLIDER_W, VIEW_SLIDER_H, yNorm, "Pos Y");
+    drawButton(VIEW_PANEL_X + VIEW_SLIDER_GAP * 3.0f, VIEW_PANEL_Y - 0.01f, 0.10f, 0.05f, "Reset");
+}
+
+bool hitTestViewControls(float fx, float fy) {
+    auto setFromNorm = [&](int which, float norm) {
+        norm = std::max(0.0f, std::min(1.0f, norm));
+        activeViewSlider = which;
+        if (which == 0)
+            videoScale = VIDEO_SCALE_MIN + norm * (VIDEO_SCALE_MAX - VIDEO_SCALE_MIN);
+        else if (which == 1)
+            videoOffsetX = norm * 2.0f - 1.0f;
+        else if (which == 2)
+            videoOffsetY = norm * 2.0f - 1.0f;
+    };
+
+    if (isInside(fx, fy, VIEW_PANEL_X, VIEW_PANEL_Y, VIEW_SLIDER_W, VIEW_SLIDER_H)) {
+        setFromNorm(0, (fx - VIEW_PANEL_X) / VIEW_SLIDER_W);
+        return true;
+    }
+    if (isInside(fx, fy, VIEW_PANEL_X + VIEW_SLIDER_GAP, VIEW_PANEL_Y, VIEW_SLIDER_W, VIEW_SLIDER_H)) {
+        setFromNorm(1, (fx - (VIEW_PANEL_X + VIEW_SLIDER_GAP)) / VIEW_SLIDER_W);
+        return true;
+    }
+    if (isInside(fx, fy, VIEW_PANEL_X + VIEW_SLIDER_GAP * 2.0f, VIEW_PANEL_Y, VIEW_SLIDER_W, VIEW_SLIDER_H)) {
+        setFromNorm(2, (fx - (VIEW_PANEL_X + VIEW_SLIDER_GAP * 2.0f)) / VIEW_SLIDER_W);
+        return true;
+    }
+    if (isInside(fx, fy, VIEW_PANEL_X + VIEW_SLIDER_GAP * 3.0f, VIEW_PANEL_Y - 0.01f, 0.10f, 0.05f)) {
+        videoScale = 1.0f;
+        videoOffsetX = 0.0f;
+        videoOffsetY = 0.0f;
+        activeViewSlider = -1;
+        return true;
+    }
+    return false;
 }
 
 void mouse(int button, int state, int x, int y) {
-    if (button != GLUT_LEFT_BUTTON || !showUI) return;
+    if (!showUI) return;
 
     float fx = (float)x / windowWidth * 2.0f - 1.0f;
     float fy = 1.0f - (float)y / windowHeight * 2.0f;
+
+    // Right-click toggles pie menu (also closes if already open)
+    if (button == GLUT_RIGHT_BUTTON && state == GLUT_DOWN) {
+        if (showPieMenu) {
+            showPieMenu = false;
+            pieHoverIndex = -1;
+        } else {
+            showPieMenu = true;
+            pieMenuCenterX = fx;
+            pieMenuCenterY = fy;
+            updatePieHover(fx, fy);
+        }
+        return;
+    }
+
+    if (button != GLUT_LEFT_BUTTON) return;
 
     if (button == GLUT_LEFT_BUTTON) {
         mouseLeftDown = (state == GLUT_DOWN);
@@ -927,7 +1110,7 @@ void mouse(int button, int state, int x, int y) {
             }
             else if (isInside(fx, fy, -0.15f, -0.85f, 0.15f * uiScale, 0.08f * uiScale)) {
                 currentVideoIndex = (currentVideoIndex + 1) % playlist.size();
-                cap.open(playlist[currentVideoIndex]);
+                openVideoSource(playlist[currentVideoIndex]);
                 if (cap.isOpened()) {
                     videoDuration = cap.get(cv::CAP_PROP_FRAME_COUNT) / cap.get(cv::CAP_PROP_FPS);
                 }
@@ -954,157 +1137,126 @@ void mouse(int button, int state, int x, int y) {
                 }
             }
 
-            // Check sliders (updated y positions)
-            for (size_t i = 0; i < filters.size(); ++i) {
-                if (!filters[i]->enabled) continue;
-                
-                float sy = -0.7f * uiScale + 0.15f * uiScale * i;
-                
-                if (filters[i]->hasStrength()) {
-                    if (isInside(fx, fy, 0.6f * uiScale, sy, 0.35f * uiScale, 0.03f * uiScale)) {
-                        activeSlider = i * 3; // Strength slider
-                        filters[i]->strength = std::max(0.0f, std::min(1.0f, (fx - 0.6f * uiScale) / (0.35f * uiScale)));
-                        return;
-                    }
-                    sy += 0.05f * uiScale;
-                }
-                
-                if (filters[i]->hasParam1()) {
-                    if (isInside(fx, fy, 0.6f * uiScale, sy, 0.35f * uiScale, 0.03f * uiScale)) {
-                        activeSlider = i * 3 + 1; // Param1 slider
-                        filters[i]->param1 = std::max(0.0f, std::min(1.0f, (fx - 0.6f * uiScale) / (0.35f * uiScale)));
-                        return;
-                    }
-                    sy += 0.05f * uiScale;
-                }
-                
-                if (filters[i]->hasParam2()) {
-                    if (isInside(fx, fy, 0.6f * uiScale, sy, 0.35f * uiScale, 0.03f * uiScale)) {
-                        activeSlider = i * 3 + 2; // Param2 slider
-                        filters[i]->param2 = std::max(0.0f, std::min(1.0f, (fx - 0.6f * uiScale) / (0.35f * uiScale)));
-                        return;
-                    }
-                }
-            }
-            if (fx < 0.5f && !showPieMenu) {
-                showPieMenu = !showPieMenu;
-                pieMenuCenterX = fx;
-                pieMenuCenterY = fy;
+            // Active Effects panel sliders (left side)
+            if (hitTestActiveEffectsSliders(fx, fy)) {
                 return;
             }
 
+            // When pie is open, handle it before other empty-area actions
             if (showPieMenu) {
-                // Check pie menu selection
                 float dx = fx - pieMenuCenterX;
                 float dy = fy - pieMenuCenterY;
-                float dist = sqrt(dx*dx + dy*dy);
-                
-                // First check if we clicked on any slider in the active effects list
-                bool anyEnabled = false;
-                for (const auto& filter : filters) {
-                    if (filter->enabled) {
-                        anyEnabled = true;
-                        break;
-                    }
-                }
-                
-                if (anyEnabled && fx < pieMenuCenterX - 0.1f) {
-                    // Check if click is in the slider list area
-                    const float listX = pieMenuCenterX - 0.5f;
-                    const float listY = pieMenuCenterY - 0.4f;
-                    const float listWidth = 0.4f;
-                    const float listHeight = 0.8f;
-                    
-                    if (fx >= listX && fx <= listX + listWidth && 
-                        fy >= listY && fy <= listY + listHeight) {
-                        
-                        // Find which slider was clicked
-                        float currentY = listY + listHeight - 0.08f;
-                        for (size_t i = 0; i < filters.size(); ++i) {
-                            if (!filters[i]->enabled) continue;
-                            
-                            currentY -= 0.05f; // Skip name
-                            
-                            if (filters[i]->hasStrength()) {
-                                if (fy >= currentY && fy <= currentY + 0.03f * uiScale) {
-                                    activeSlider = i * 3;
-                                    filters[i]->strength = std::max(0.0f, std::min(1.0f, 
-                                        (fx - (listX + 0.02f)) / 0.3f));
-                                    break;
-                                }
-                                currentY -= 0.05f;
-                            }
-                            
-                            if (filters[i]->hasParam1()) {
-                                if (fy >= currentY && fy <= currentY + 0.03f * uiScale) {
-                                    activeSlider = i * 3 + 1;
-                                    filters[i]->param1 = std::max(0.0f, std::min(1.0f, 
-                                        (fx - (listX + 0.02f)) / 0.3f));
-                                    break;
-                                }
-                                currentY -= 0.05f;
-                            }
-                            
-                            if (filters[i]->hasParam2()) {
-                                if (fy >= currentY && fy <= currentY + 0.03f * uiScale) {
-                                    activeSlider = i * 3 + 2;
-                                    filters[i]->param2 = std::max(0.0f, std::min(1.0f, 
-                                        (fx - (listX + 0.02f)) / 0.3f));
-                                    break;
-                                }
-                                currentY -= 0.05f;
-                            }
-                            
-                            currentY -= 0.02f; // Extra spacing
-                        }
-                    }
-                }
-                else if (dist <= PIE_MENU_RADIUS) {
-                    float angle = atan2(dy, dx);
-                    if (angle < 0) angle += 2.0f * M_PI;
-                    
+                float dist = std::sqrt(dx * dx + dy * dy);
+
+                if (dist <= PIE_MENU_INNER) {
+                    showPieMenu = false;
+                    pieHoverIndex = -1;
+                } else if (dist <= PIE_MENU_RADIUS) {
+                    float angle = std::atan2(dy, dx);
+                    if (angle < 0.0f) angle += 2.0f * M_PI;
                     int selected = static_cast<int>((angle / (2.0f * M_PI)) * filters.size());
-                    if (selected >= 0 && selected < filters.size()) {
+                    if (selected >= 0 && selected < static_cast<int>(filters.size())) {
                         filters[selected]->enabled = !filters[selected]->enabled;
-                        activeSlider = selected * 3; // Activate strength slider
+                        activeSlider = selected * 3;
                     }
+                } else {
+                    showPieMenu = false;
+                    pieHoverIndex = -1;
                 }
+                return;
+            }
+
+            // View scale / position controls
+            if (hitTestViewControls(fx, fy)) {
+                return;
+            }
+
+            // Don't open the pie menu over the Active Effects / View panels
+            if (anyFilterEnabled()) {
+                const float listY = std::max(AE_BOTTOM_LIMIT, AE_TOP_Y - activeEffectsContentHeight());
+                if (fx >= AE_PANEL_X && fx <= AE_PANEL_X + AE_PANEL_W &&
+                    fy >= listY && fy <= AE_TOP_Y) {
+                    return;
+                }
+            }
+            if (fx >= VIEW_PANEL_X - 0.02f && fx <= VIEW_PANEL_X + 0.92f &&
+                fy >= VIEW_PANEL_Y - 0.02f && fy <= VIEW_PANEL_Y + 0.10f) {
+                return;
+            }
+
+            // Left-click empty area opens pie menu
+            if (fx < 0.55f) {
+                showPieMenu = true;
+                pieMenuCenterX = fx;
+                pieMenuCenterY = fy;
+                updatePieHover(fx, fy);
                 return;
             }
 
         } else if (state == GLUT_UP) {
-            //showPieMenu = false;
             activeSlider = -1;
+            activeViewSlider = -1;
             isSeeking = false;
         }
     }
 }
 
 void mouseMotion(int x, int y) {
-
     float fx = (float)x / windowWidth * 2.0f - 1.0f;
-    
+    float fy = 1.0f - (float)y / windowHeight * 2.0f;
+
+    updatePieHover(fx, fy);
+
     if (isSeeking && mouseLeftDown) {
         double seekPos = std::max(0.0, std::min(1.0, ((double)fx + 0.95f) / 1.9f));
         seekVideo(seekPos * videoDuration);
         return;
     }
 
-    if (activeSlider == -1 || !showUI) return;
+    if (!showUI) return;
 
-    //float fx = (float)x / windowWidth * 2.0f - 1.0f;
+    if (activeViewSlider >= 0 && mouseLeftDown) {
+        float norm = 0.0f;
+        if (activeViewSlider == 0)
+            norm = (fx - VIEW_PANEL_X) / VIEW_SLIDER_W;
+        else if (activeViewSlider == 1)
+            norm = (fx - (VIEW_PANEL_X + VIEW_SLIDER_GAP)) / VIEW_SLIDER_W;
+        else
+            norm = (fx - (VIEW_PANEL_X + VIEW_SLIDER_GAP * 2.0f)) / VIEW_SLIDER_W;
+        norm = std::max(0.0f, std::min(1.0f, norm));
+        if (activeViewSlider == 0)
+            videoScale = VIDEO_SCALE_MIN + norm * (VIDEO_SCALE_MAX - VIDEO_SCALE_MIN);
+        else if (activeViewSlider == 1)
+            videoOffsetX = norm * 2.0f - 1.0f;
+        else
+            videoOffsetY = norm * 2.0f - 1.0f;
+        glutPostRedisplay();
+        return;
+    }
+
+    if (activeSlider == -1) return;
+
     int filterIdx = activeSlider / 3;
     int paramType = activeSlider % 3;
-    
-    float normalizedValue = std::max(0.0f, std::min(1.0f, (fx - 0.6f * uiScale) / (0.35f * uiScale)));
-    
+    if (filterIdx < 0 || filterIdx >= static_cast<int>(filters.size())) return;
+
+    float normalizedValue = std::max(0.0f, std::min(1.0f, (fx - AE_CONTENT_X) / AE_SLIDER_W));
     switch (paramType) {
         case 0: filters[filterIdx]->strength = normalizedValue; break;
         case 1: filters[filterIdx]->param1 = normalizedValue; break;
         case 2: filters[filterIdx]->param2 = normalizedValue; break;
     }
-    
+
     glutPostRedisplay();
+}
+
+void passiveMouseMotion(int x, int y) {
+    float fx = (float)x / windowWidth * 2.0f - 1.0f;
+    float fy = 1.0f - (float)y / windowHeight * 2.0f;
+    int prev = pieHoverIndex;
+    updatePieHover(fx, fy);
+    if (prev != pieHoverIndex)
+        glutPostRedisplay();
 }
 
 void keyboard(unsigned char key, int x, int y) {
@@ -1130,7 +1282,7 @@ void keyboard(unsigned char key, int x, int y) {
         case 'n':
         case 'N':
             currentVideoIndex = (currentVideoIndex + 1) % playlist.size();
-            cap.open(playlist[currentVideoIndex]);
+            openVideoSource(playlist[currentVideoIndex]);
             if (cap.isOpened()) {
                 videoDuration = cap.get(cv::CAP_PROP_FRAME_COUNT) / cap.get(cv::CAP_PROP_FPS);
             }
@@ -1149,6 +1301,36 @@ void keyboard(unsigned char key, int x, int y) {
         case 'U':
             showUI = !showUI;
             break;
+        case 'r':
+        case 'R':
+            videoScale = 1.0f;
+            videoOffsetX = 0.0f;
+            videoOffsetY = 0.0f;
+            break;
+        case 'o':
+        case 'O':
+            videoScale = std::max(VIDEO_SCALE_MIN, videoScale - 0.05f);
+            break;
+        case 'p':
+        case 'P':
+            videoScale = std::min(VIDEO_SCALE_MAX, videoScale + 0.05f);
+            break;
+        case 'a':
+        case 'A':
+            videoOffsetX = std::max(-1.0f, videoOffsetX - 0.05f);
+            break;
+        case 'd':
+        case 'D':
+            videoOffsetX = std::min(1.0f, videoOffsetX + 0.05f);
+            break;
+        case 'w':
+        case 'W':
+            videoOffsetY = std::min(1.0f, videoOffsetY + 0.05f);
+            break;
+        case 's':
+        case 'S':
+            videoOffsetY = std::max(-1.0f, videoOffsetY - 0.05f);
+            break;
         case '-':
             if (activeSlider >= 0) {
                 int filterIdx = activeSlider / 3;
@@ -1159,6 +1341,8 @@ void keyboard(unsigned char key, int x, int y) {
                     case 1: filters[filterIdx]->param1 = std::max(0.0f, filters[filterIdx]->param1 - step); break;
                     case 2: filters[filterIdx]->param2 = std::max(0.0f, filters[filterIdx]->param2 - step); break;
                 }
+            } else {
+                videoScale = std::max(VIDEO_SCALE_MIN, videoScale - 0.05f);
             }
             break;
         case '=':
@@ -1172,6 +1356,8 @@ void keyboard(unsigned char key, int x, int y) {
                     case 1: filters[filterIdx]->param1 = std::min(1.0f, filters[filterIdx]->param1 + step); break;
                     case 2: filters[filterIdx]->param2 = std::min(1.0f, filters[filterIdx]->param2 + step); break;
                 }
+            } else {
+                videoScale = std::min(VIDEO_SCALE_MAX, videoScale + 0.05f);
             }
             break;
         case '1':
@@ -1211,40 +1397,45 @@ void displayVideoFrame(const cv::Mat& frame) {
     cv::Mat rgb;
     cv::cvtColor(frame, rgb, cv::COLOR_BGR2RGB);
 
-    float frameAspect = (float)rgb.cols / rgb.rows;
-    float windowAspect = (float)windowWidth / windowHeight;
+    float frameAspect = (float)rgb.cols / (float)rgb.rows;
+    float windowAspect = (float)windowWidth / (float)windowHeight;
 
-    int drawWidth, drawHeight;
-    int offsetX = 0, offsetY = 0;
-
-    // Calculate dimensions to maintain aspect ratio while fitting in window
+    // Fit-contain size, then apply user scale
+    float fitW, fitH;
     if (frameAspect > windowAspect) {
-        // Video is wider than window - fit to width
-        drawWidth = windowWidth;
-        drawHeight = static_cast<int>(windowWidth / frameAspect);
-        offsetY = (windowHeight - drawHeight) / 2;
+        fitW = (float)windowWidth;
+        fitH = fitW / frameAspect;
     } else {
-        // Video is taller than window - fit to height
-        drawHeight = windowHeight;
-        drawWidth = static_cast<int>(windowHeight * frameAspect);
-        offsetX = (windowWidth - drawWidth) / 2;
+        fitH = (float)windowHeight;
+        fitW = fitH * frameAspect;
     }
 
-    // Set viewport to the calculated dimensions
-    glViewport(offsetX, offsetY, drawWidth, drawHeight);
+    int drawWidth = std::max(1, static_cast<int>(fitW * videoScale));
+    int drawHeight = std::max(1, static_cast<int>(fitH * videoScale));
+    int offsetX = (windowWidth - drawWidth) / 2 + static_cast<int>(videoOffsetX * windowWidth * 0.5f);
+    int offsetY = (windowHeight - drawHeight) / 2 + static_cast<int>(videoOffsetY * windowHeight * 0.5f);
 
-    // Draw the video frame
+    cv::Mat resized;
+    cv::resize(rgb, resized, cv::Size(drawWidth, drawHeight), 0, 0, cv::INTER_LINEAR);
+    if (!resized.isContinuous())
+        resized = resized.clone();
+
+    glViewport(0, 0, windowWidth, windowHeight);
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
-    gluOrtho2D(0, rgb.cols, 0, rgb.rows);
+    gluOrtho2D(0, windowWidth, 0, windowHeight);
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
 
-    glRasterPos2i(0, 0);
-    glDrawPixels(rgb.cols, rgb.rows, GL_RGB, GL_UNSIGNED_BYTE, rgb.data);
+    glRasterPos2i(offsetX, offsetY);
+    // Avoid invalid raster positions when heavily offset
+    GLboolean valid = GL_TRUE;
+    glGetBooleanv(GL_CURRENT_RASTER_POSITION_VALID, &valid);
+    if (valid) {
+        glDrawPixels(resized.cols, resized.rows, GL_RGB, GL_UNSIGNED_BYTE, resized.data);
+    }
 
-    // Reset viewport for UI
-    glViewport(0, 0, windowWidth, windowHeight);
+    // Reset for UI
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
     gluOrtho2D(-1.0, 1.0, -1.0, 1.0);
@@ -1281,13 +1472,14 @@ void display() {
                     frame = filter->apply(frame);
 
                 cv::flip(frame, frame, 0); // Flip vertically for OpenGL
+                latestFrame = frame;
                 displayVideoFrame(frame);
             } else {
                 if (isLooping) {
                     cap.set(cv::CAP_PROP_POS_FRAMES, 0);
                 } else {
                     currentVideoIndex = (currentVideoIndex + 1) % playlist.size();
-                    cap.open(playlist[currentVideoIndex]);
+                    openVideoSource(playlist[currentVideoIndex]);
                     if (cap.isOpened()) {
                         videoDuration = cap.get(cv::CAP_PROP_FRAME_COUNT) / cap.get(cv::CAP_PROP_FPS);
                     }
@@ -1321,38 +1513,21 @@ void display() {
         drawButton(-0.15f, -0.85f, 0.15f * uiScale, 0.08f * uiScale, "Next");
         drawButton(0.8f, -0.85f, 0.15f * uiScale, 0.08f * uiScale, fullscreen ? "FullScreen" : "Windowed");
 
-        // Filter controls
+        // Filter controls (toggles only — sliders live in the left Active Effects panel)
         for (size_t i = 0; i < filters.size(); ++i) {
             float bx = 0.6f * uiScale;
             float by = -0.8f * uiScale + 0.15f * uiScale * i;
             
-            // Filter toggle button
             std::string label = std::to_string(i+1) + ". " + filters[i]->name() + (filters[i]->enabled ? " [ON]" : " [OFF]");
             drawButton(bx, by, 0.35f * uiScale, 0.08f * uiScale, label, false, filters[i]->enabled);
-
-            // Sliders for active filters
-            if (filters[i]->enabled) {
-                float sy = by + 0.1f * uiScale;
-                
-                if (filters[i]->hasStrength()) {
-                    drawSlider(bx, sy, 0.35f * uiScale, 0.03f * uiScale, filters[i]->strength, "Strength");
-                    sy += 0.07f * uiScale;
-                }
-                
-                if (filters[i]->hasParam1()) {
-                    drawSlider(bx, sy, 0.35f * uiScale, 0.03f * uiScale, filters[i]->param1, filters[i]->param1Name());
-                    sy += 0.07f * uiScale;
-                }
-                
-                if (filters[i]->hasParam2()) {
-                    drawSlider(bx, sy, 0.35f * uiScale, 0.03f * uiScale, filters[i]->param2, filters[i]->param2Name());
-                }
-            }
         }
+
+        drawActiveEffectsPanel();
+        drawViewControls();
 
         // Help text
         drawText(-0.95f, 0.95f, "Space: Play/Pause | L: Loop | N: Next | F: Fullscreen | U: Toggle UI | 1-9: Filters");
-        drawText(-0.95f, 0.9f, "-/=: Adjust slider | </>: Seek 5s | [/]: Speed | Click progress bar to seek");
+        drawText(-0.95f, 0.9f, "Right-click: Pie menu | WASD: Move video | O/P: Scale | R: Reset view | [/]: Speed");
     }
 
     drawPieMenu();
@@ -1402,8 +1577,7 @@ int main(int argc, char** argv) {
     if (playlist.empty()) playlist.push_back("0");
 
     // Initialize video capture
-    cap.open(playlist[0]);
-    if (!cap.isOpened()) {
+    if (!openVideoSource(playlist[0])) {
         std::cerr << "Failed to open source." << std::endl;
         return -1;
     }
@@ -1493,6 +1667,7 @@ int main(int argc, char** argv) {
     glutReshapeFunc(reshape);
     glutMouseFunc(mouse);
     glutMotionFunc(mouseMotion);
+    glutPassiveMotionFunc(passiveMouseMotion);
     glutKeyboardFunc(keyboard);
 
     // Main loop
