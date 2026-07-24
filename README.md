@@ -103,7 +103,7 @@ Filter enable flags: `anaglyph`, `anaglyphseq`, `motionpop`, `wavepop`, `gray`, 
 
 **Wave Pop 3D** (`--enable-wavepop`): same persistent tracking as Motion Pop, but tracked regions extrude with a soft raised-cosine **wave** (elliptical mound) instead of a hard box. Default view keeps the video fully in-frame; raise **Orbit Pitch** / shift **Orbit Yaw** to inspect the 3D extrusion.
 
-Sliders: Strength, Strictness, Wave Soft, Wave Radius, Orbit Yaw, Orbit Pitch, Pop Scale, Hold Time, Anaglyph.
+Sliders: Strength, Strictness, Wave Soft, Wave Radius, Orbit Yaw, Orbit Pitch, Pop Scale (nonlinear — fine at low end, large at high), Hold Time, Anaglyph, **Size Depth** (larger tracks extrude farther), **Motion Point** (mound tips toward movement).
 
 Calibration tools (under the sliders): **Reset** (params + tracks + background model), **Front** (snap orbit), **Tracks** / **Motion** / **Height** overlays, **Relearn** (background only). Status line shows track counts. Scroll the Active Effects panel with the mouse wheel if needed.
 

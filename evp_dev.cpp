@@ -49,8 +49,8 @@ int controlSavedX = 920, controlSavedY = 80, controlSavedW = 960, controlSavedH 
 int windowWidth = 960, windowHeight = 720;
 float uiScale = 1.0f;
 int activeSlider = -1; // -1 means no slider is active
-// Encodes activeSlider as filterIdx * AE_SLIDER_STRIDE + paramType (0=strength .. 8=param8)
-const int AE_SLIDER_STRIDE = 9;
+// Encodes activeSlider as filterIdx * AE_SLIDER_STRIDE + paramType (0=strength .. 10=param10)
+const int AE_SLIDER_STRIDE = 11;
 float aePanelScroll = 0.0f; // scroll offset for tall Active Effects lists
 bool isSeeking = false;
 double videoDuration = 0;
@@ -158,6 +158,8 @@ public:
     virtual bool hasParam6() const { return false; }
     virtual bool hasParam7() const { return false; }
     virtual bool hasParam8() const { return false; }
+    virtual bool hasParam9() const { return false; }
+    virtual bool hasParam10() const { return false; }
     virtual std::string param1Name() const { return ""; }
     virtual std::string param2Name() const { return ""; }
     virtual std::string param3Name() const { return ""; }
@@ -166,6 +168,8 @@ public:
     virtual std::string param6Name() const { return ""; }
     virtual std::string param7Name() const { return ""; }
     virtual std::string param8Name() const { return ""; }
+    virtual std::string param9Name() const { return ""; }
+    virtual std::string param10Name() const { return ""; }
     virtual bool hasReset() const { return false; }
     virtual void reset() {}
     // Optional calibration / tool buttons drawn under a filter's sliders
@@ -185,6 +189,8 @@ public:
     float param6 = 0.5f;
     float param7 = 0.5f;
     float param8 = 0.5f;
+    float param9 = 0.5f;
+    float param10 = 0.5f;
     virtual ~VideoFilter() = default;
 };
 
@@ -502,9 +508,11 @@ class WavePop3DFilter : public VideoFilter {
     struct Track {
         cv::Rect box;
         cv::Point2f center;
+        cv::Point2f vel{0.f, 0.f}; // smoothed px/frame
         double area = 0.0;
         float halfW = 40.0f;
         float halfH = 40.0f;
+        float sizeNorm = 0.5f; // 0..1 relative to frame
         int age = 0;
         int missed = 0;
     };
@@ -640,16 +648,22 @@ class WavePop3DFilter : public VideoFilter {
                 if (score > bestScore) { bestScore = score; best = static_cast<int>(i); }
             }
             if (best >= 0) {
-                tr.box = detections[best].box;
-                tr.center = detections[best].center;
-                tr.area = detections[best].area;
-                tr.halfW = detections[best].halfW;
-                tr.halfH = detections[best].halfH;
+                const auto& d = detections[best];
+                cv::Point2f rawVel = d.center - tr.center;
+                tr.vel = tr.vel * 0.72f + rawVel * 0.28f;
+                tr.box = d.box;
+                tr.center = d.center;
+                tr.area = d.area;
+                tr.halfW = d.halfW;
+                tr.halfH = d.halfH;
+                float rel = static_cast<float>(std::sqrt(d.area / std::max(1.0, frameArea)));
+                tr.sizeNorm = std::max(0.0f, std::min(1.0f, rel / 0.42f));
                 tr.age += 1;
                 tr.missed = 0;
                 used[best] = 1;
             } else {
                 tr.missed += 1;
+                tr.vel *= 0.85f;
             }
         }
         tracks.erase(std::remove_if(tracks.begin(), tracks.end(),
@@ -657,22 +671,48 @@ class WavePop3DFilter : public VideoFilter {
                      tracks.end());
         for (size_t i = 0; i < detections.size(); ++i) {
             if (used[i]) continue;
-            tracks.push_back({detections[i].box, detections[i].center, detections[i].area,
-                              detections[i].halfW, detections[i].halfH, 1, 0});
+            Track t;
+            t.box = detections[i].box;
+            t.center = detections[i].center;
+            t.vel = {0.f, 0.f};
+            t.area = detections[i].area;
+            t.halfW = detections[i].halfW;
+            t.halfH = detections[i].halfH;
+            float rel = static_cast<float>(std::sqrt(detections[i].area / std::max(1.0, frameArea)));
+            t.sizeNorm = std::max(0.0f, std::min(1.0f, rel / 0.42f));
+            t.age = 1;
+            t.missed = 0;
+            tracks.push_back(t);
         }
     }
 
-    // Raised-cosine mound over each track ellipse (0 outside, 1 at center).
-    // Age fades in so pops appear sooner and ramp smoothly.
-    float heightAt(float u, float v, int frameW, int frameH) const {
-        // param7 = Hold Time (how long before full pop)
-        const int minAge = 4 + static_cast<int>((0.25f + param7 * 0.75f) * (8 + param1 * 20.0f));
-        const float radiusMul = 0.7f + param3 * 1.5f;            // Wave Radius
-        const float softPow = 0.35f + param2 * 1.8f;             // Wave Soft
-        // Strength + Pop Scale drive extrusion height
-        const float amp = (0.15f + strength * 0.95f) * (0.45f + param6 * 1.35f);
+    // Pop Scale slider: fine fractional control at the low end, still reaches a large high end.
+    static float popScaleCurve(float t) {
+        t = std::max(0.0f, std::min(1.0f, t));
+        // pow>1 keeps most of the slider in the subtle range, then ramps up hard
+        const float shaped = std::pow(t, 2.35f);
+        return 0.012f + shaped * 2.98f; // ~0.01 .. ~3.0
+    }
 
-        float bump = 0.0f;
+    struct WaveSample {
+        float h = 0.0f;
+        float ox = 0.0f; // world X lean from motion
+        float oy = 0.0f; // world Y lean from motion
+    };
+
+    // Raised-cosine mound; depth scales with track size; tips toward motion.
+    WaveSample sampleWave(float u, float v, int frameW, int frameH) const {
+        const int minAge = 4 + static_cast<int>((0.25f + param7 * 0.75f) * (8 + param1 * 20.0f));
+        const float radiusMul = 0.7f + param3 * 1.5f;
+        const float softPow = 0.35f + param2 * 1.8f;
+        const float pop = popScaleCurve(param6);
+        const float baseAmp = (0.08f + strength * 0.92f) * pop;
+        const float sizeAmt = param9;   // Size Depth
+        const float pointAmt = param10; // Motion Point
+        const float diag = std::sqrt(static_cast<float>(frameW * frameW + frameH * frameH));
+
+        WaveSample best;
+        float bestW = 0.0f;
         for (const auto& tr : tracks) {
             if (tr.age < minAge / 2) continue;
             float maturity = std::min(1.0f, tr.age / static_cast<float>(std::max(1, minAge)));
@@ -687,9 +727,44 @@ class WavePop3DFilter : public VideoFilter {
             float t = std::sqrt(r2);
             float wave = 0.5f * (1.0f + std::cos(static_cast<float>(M_PI) * t));
             wave = std::pow(std::max(0.0f, wave), softPow);
-            bump = std::max(bump, wave * maturity);
+
+            // Larger tracks push farther out of the screen; small tracks stay subtle
+            float sizeDepth = (1.0f - 0.75f * sizeAmt) + tr.sizeNorm * (1.55f * sizeAmt);
+            float h = wave * maturity * baseAmp * sizeDepth;
+
+            // Tip / point the mound along smoothed velocity (leading edge rises ahead)
+            float speed = std::sqrt(tr.vel.x * tr.vel.x + tr.vel.y * tr.vel.y);
+            float lean = 0.0f, ldx = 0.0f, ldy = 0.0f;
+            if (speed > 0.15f && pointAmt > 0.01f) {
+                float invSp = 1.0f / speed;
+                float dirU = (tr.vel.x * invSp); // +x right in image
+                float dirV = (tr.vel.y * invSp); // +y down in image
+                // Along-motion coordinate inside the ellipse (-1..1-ish)
+                float along = nx * dirU * (rx / std::max(rx, ry)) + ny * dirV * (ry / std::max(rx, ry));
+                float tip = 0.5f + 0.5f * along; // higher on leading side
+                h *= (1.0f - 0.35f * pointAmt) + tip * (0.7f * pointAmt);
+                lean = pointAmt * wave * maturity * std::min(1.0f, speed / (0.02f * diag)) * h;
+                // World X follows image X; world Y is up so flip image V
+                ldx = dirU * lean * 1.15f;
+                ldy = -dirV * lean * 1.15f;
+            }
+
+            if (wave * maturity >= bestW) {
+                bestW = wave * maturity;
+                best.h = h;
+                best.ox = ldx;
+                best.oy = ldy;
+            } else if (h > best.h) {
+                best.h = h;
+                best.ox = ldx;
+                best.oy = ldy;
+            }
         }
-        return bump * amp;
+        return best;
+    }
+
+    float heightAt(float u, float v, int frameW, int frameH) const {
+        return sampleWave(u, v, frameW, frameH).h;
     }
 
     cv::Mat buildHeightMap(int rows, int cols) const {
@@ -789,7 +864,10 @@ public:
 
                 float px = (u - 0.5f) * 2.0f * aspect;
                 float py = (0.5f - v) * 2.0f;
-                float pz = heightAt(u, v, frame.cols, frame.rows);
+                WaveSample w = sampleWave(u, v, frame.cols, frame.rows);
+                px += w.ox;
+                py += w.oy;
+                float pz = w.h;
 
                 // Yaw around Y, then pitch around X
                 float x1 = px * cy + pz * sy;
@@ -878,10 +956,17 @@ public:
                                                          std::max(2, static_cast<int>(ry))),
                             0, 0, 360, col, 2, cv::LINE_AA);
                 cv::circle(output, tr.center, 3, col, -1, cv::LINE_AA);
-                std::string label = "a" + std::to_string(tr.age);
-                cv::putText(output, label,
+                // Motion pointing arrow
+                float speed = std::sqrt(tr.vel.x * tr.vel.x + tr.vel.y * tr.vel.y);
+                if (speed > 0.4f) {
+                    cv::Point2f tip = tr.center + tr.vel * (6.0f + param10 * 10.0f);
+                    cv::arrowedLine(output, tr.center, tip, cv::Scalar(0, 220, 255), 2, cv::LINE_AA, 0, 0.35);
+                }
+                char buf[64];
+                std::snprintf(buf, sizeof(buf), "a%d s%.2f", tr.age, tr.sizeNorm);
+                cv::putText(output, buf,
                             {static_cast<int>(tr.center.x) + 6, static_cast<int>(tr.center.y) - 6},
-                            cv::FONT_HERSHEY_SIMPLEX, 0.45, col, 1, cv::LINE_AA);
+                            cv::FONT_HERSHEY_SIMPLEX, 0.4, col, 1, cv::LINE_AA);
             }
         }
 
@@ -895,9 +980,11 @@ public:
         param3 = 0.65f; // Wave Radius
         param4 = 0.5f;  // Orbit Yaw
         param5 = 0.0f;  // Orbit Pitch
-        param6 = 0.7f;  // Pop Scale
+        param6 = 0.55f; // Pop Scale (nonlinear; mid still moderate)
         param7 = 0.4f;  // Hold Time
         param8 = 0.55f; // Anaglyph
+        param9 = 0.65f; // Size Depth
+        param10 = 0.55f; // Motion Point
     }
 
     void resetTracking() {
@@ -923,6 +1010,8 @@ public:
     bool hasParam6() const override { return true; }
     bool hasParam7() const override { return true; }
     bool hasParam8() const override { return true; }
+    bool hasParam9() const override { return true; }
+    bool hasParam10() const override { return true; }
     std::string param1Name() const override { return "Strictness"; }
     std::string param2Name() const override { return "Wave Soft"; }
     std::string param3Name() const override { return "Wave Radius"; }
@@ -931,6 +1020,8 @@ public:
     std::string param6Name() const override { return "Pop Scale"; }
     std::string param7Name() const override { return "Hold Time"; }
     std::string param8Name() const override { return "Anaglyph"; }
+    std::string param9Name() const override { return "Size Depth"; }
+    std::string param10Name() const override { return "Motion Point"; }
     bool hasReset() const override { return true; }
 
     int toolButtonCount() const override { return 6; }
@@ -2032,6 +2123,8 @@ float activeEffectsContentHeight() {
         if (filter->hasParam6()) h += AE_SLIDER_STEP;
         if (filter->hasParam7()) h += AE_SLIDER_STEP;
         if (filter->hasParam8()) h += AE_SLIDER_STEP;
+        if (filter->hasParam9()) h += AE_SLIDER_STEP;
+        if (filter->hasParam10()) h += AE_SLIDER_STEP;
         int tools = filter->toolButtonCount();
         if (tools > 0) {
             int rows = (tools + 1) / 2;
@@ -2115,6 +2208,8 @@ void drawActiveEffectsPanel() {
         if (filters[i]->hasParam6()) drawParam(filters[i]->param6, filters[i]->param6Name());
         if (filters[i]->hasParam7()) drawParam(filters[i]->param7, filters[i]->param7Name());
         if (filters[i]->hasParam8()) drawParam(filters[i]->param8, filters[i]->param8Name());
+        if (filters[i]->hasParam9()) drawParam(filters[i]->param9, filters[i]->param9Name());
+        if (filters[i]->hasParam10()) drawParam(filters[i]->param10, filters[i]->param10Name());
 
         int tools = filters[i]->toolButtonCount();
         if (tools > 0) {
@@ -2184,6 +2279,8 @@ bool hitTestActiveEffectsSliders(float fx, float fy) {
         if (filters[i]->hasParam6() && trySlider(6, filters[i]->param6)) return true;
         if (filters[i]->hasParam7() && trySlider(7, filters[i]->param7)) return true;
         if (filters[i]->hasParam8() && trySlider(8, filters[i]->param8)) return true;
+        if (filters[i]->hasParam9() && trySlider(9, filters[i]->param9)) return true;
+        if (filters[i]->hasParam10() && trySlider(10, filters[i]->param10)) return true;
 
         int tools = filters[i]->toolButtonCount();
         if (tools > 0) {
@@ -2731,6 +2828,8 @@ void mouseMotion(int x, int y) {
         case 6: filters[filterIdx]->param6 = normalizedValue; break;
         case 7: filters[filterIdx]->param7 = normalizedValue; break;
         case 8: filters[filterIdx]->param8 = normalizedValue; break;
+        case 9: filters[filterIdx]->param9 = normalizedValue; break;
+        case 10: filters[filterIdx]->param10 = normalizedValue; break;
     }
 
     glutPostRedisplay();
@@ -2859,6 +2958,8 @@ void keyboard(unsigned char key, int x, int y) {
                     case 6: filters[filterIdx]->param6 = std::max(0.0f, filters[filterIdx]->param6 - step); break;
                     case 7: filters[filterIdx]->param7 = std::max(0.0f, filters[filterIdx]->param7 - step); break;
                     case 8: filters[filterIdx]->param8 = std::max(0.0f, filters[filterIdx]->param8 - step); break;
+                    case 9: filters[filterIdx]->param9 = std::max(0.0f, filters[filterIdx]->param9 - step); break;
+                    case 10: filters[filterIdx]->param10 = std::max(0.0f, filters[filterIdx]->param10 - step); break;
                 }
             } else {
                 videoScale = std::max(VIDEO_SCALE_MIN, videoScale - 0.05f);
@@ -2880,6 +2981,8 @@ void keyboard(unsigned char key, int x, int y) {
                     case 6: filters[filterIdx]->param6 = std::min(1.0f, filters[filterIdx]->param6 + step); break;
                     case 7: filters[filterIdx]->param7 = std::min(1.0f, filters[filterIdx]->param7 + step); break;
                     case 8: filters[filterIdx]->param8 = std::min(1.0f, filters[filterIdx]->param8 + step); break;
+                    case 9: filters[filterIdx]->param9 = std::min(1.0f, filters[filterIdx]->param9 + step); break;
+                    case 10: filters[filterIdx]->param10 = std::min(1.0f, filters[filterIdx]->param10 + step); break;
                 }
             } else {
                 videoScale = std::min(VIDEO_SCALE_MAX, videoScale + 0.05f);
