@@ -192,6 +192,60 @@ public:
     std::string param2Name() const override { return "Left Eye"; }
 };
 
+// Temporal anaglyph: alternate full-frame red vs blue/cyan views each frame
+// so only one eye channel is visible at a time (field-sequential style).
+class AlternatingAnaglyphFilter : public VideoFilter {
+    int frameTick = 0;
+public:
+    cv::Mat apply(const cv::Mat& frame) override {
+        if (!enabled || frame.empty()) return frame;
+
+        int shift = static_cast<int>(10 * strength);
+        if (frame.cols <= shift) return frame;
+
+        cv::Mat left = frame(cv::Rect(0, 0, frame.cols - shift, frame.rows));
+        cv::Mat right = frame(cv::Rect(shift, 0, frame.cols - shift, frame.rows));
+
+        // Even ticks: red (left). Odd ticks: blue/cyan (right).
+        // param1 > 0.5 swaps which eye appears first.
+        bool showRed = ((frameTick & 1) == 0);
+        if (param1 > 0.5f) showRed = !showRed;
+        ++frameTick;
+
+        const float gain = std::max(0.0f, std::min(1.0f, param2));
+        cv::Mat output(frame.rows, frame.cols - shift, CV_8UC3);
+        for (int y = 0; y < output.rows; ++y) {
+            for (int x = 0; x < output.cols; ++x) {
+                cv::Vec3b lpx = left.at<cv::Vec3b>(y, x);
+                cv::Vec3b rpx = right.at<cv::Vec3b>(y, x);
+                if (showRed) {
+                    // Left eye only — red channel (BGR: index 2)
+                    output.at<cv::Vec3b>(y, x) = {
+                        0,
+                        0,
+                        static_cast<uchar>(lpx[2] * gain)
+                    };
+                } else {
+                    // Right eye only — blue + green (cyan) channels
+                    output.at<cv::Vec3b>(y, x) = {
+                        static_cast<uchar>(rpx[0] * gain),
+                        static_cast<uchar>(rpx[1] * gain),
+                        0
+                    };
+                }
+            }
+        }
+        cv::copyMakeBorder(output, output, 0, 0, 0, shift, cv::BORDER_CONSTANT);
+        return output;
+    }
+
+    std::string name() const override { return "Anaglyph Seq"; }
+    bool hasParam1() const override { return true; }
+    bool hasParam2() const override { return true; }
+    std::string param1Name() const override { return "Swap Phase"; }
+    std::string param2Name() const override { return "Eye Gain"; }
+};
+
 class GrayscaleFilter : public VideoFilter {
 public:
     cv::Mat apply(const cv::Mat& frame) override {
@@ -2827,6 +2881,10 @@ int main(int argc, char** argv) {
     auto anaglyph = std::make_unique<Anaglyph3DFilter>();
     anaglyph->enabled = enabled.count("anaglyph");
     filters.push_back(std::move(anaglyph));
+
+    auto anaglyphSeq = std::make_unique<AlternatingAnaglyphFilter>();
+    anaglyphSeq->enabled = enabled.count("anaglyphseq") || enabled.count("anaglyph-seq");
+    filters.push_back(std::move(anaglyphSeq));
 
     auto gray = std::make_unique<GrayscaleFilter>();
     gray->enabled = enabled.count("gray");
