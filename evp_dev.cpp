@@ -118,6 +118,15 @@ int cameraScroll = 0;
 const int SOURCE_MENU_ROWS = 12;
 namespace fs = std::filesystem;
 
+// Scrollable filter toggle list (right side of control panel)
+int filterListScroll = 0;
+const float FILT_PANEL_X = 0.48f;
+const float FILT_PANEL_W = 0.48f;
+const float FILT_PANEL_TOP = 0.82f;
+const float FILT_PANEL_BOTTOM = -0.68f;
+const float FILT_ROW_H = 0.072f;
+const float FILT_BTN_H = 0.055f;
+
 // Colors
 struct Color {
     float r, g, b;
@@ -1105,6 +1114,103 @@ void drawButton(float x, float y, float w, float h, const std::string& label, bo
 
 void drawSlider(float x, float y, float w, float h, float value, const std::string& label);
 
+int filterListVisibleRows() {
+    const float usable = (FILT_PANEL_TOP - 0.10f) - (FILT_PANEL_BOTTOM + 0.08f);
+    return std::max(1, static_cast<int>(usable / FILT_ROW_H));
+}
+
+void clampFilterListScroll() {
+    int visible = filterListVisibleRows();
+    int maxScroll = std::max(0, static_cast<int>(filters.size()) - visible);
+    filterListScroll = std::max(0, std::min(filterListScroll, maxScroll));
+}
+
+void drawFilterListPanel() {
+    clampFilterListScroll();
+    const int visible = filterListVisibleRows();
+    const int total = static_cast<int>(filters.size());
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glColor4f(0.08f, 0.08f, 0.12f, 0.85f);
+    glBegin(GL_QUADS);
+    glVertex2f(FILT_PANEL_X, FILT_PANEL_BOTTOM);
+    glVertex2f(FILT_PANEL_X + FILT_PANEL_W, FILT_PANEL_BOTTOM);
+    glVertex2f(FILT_PANEL_X + FILT_PANEL_W, FILT_PANEL_TOP);
+    glVertex2f(FILT_PANEL_X, FILT_PANEL_TOP);
+    glEnd();
+    glColor4f(0.35f, 0.35f, 0.45f, 0.95f);
+    glLineWidth(1.5f);
+    glBegin(GL_LINE_LOOP);
+    glVertex2f(FILT_PANEL_X, FILT_PANEL_BOTTOM);
+    glVertex2f(FILT_PANEL_X + FILT_PANEL_W, FILT_PANEL_BOTTOM);
+    glVertex2f(FILT_PANEL_X + FILT_PANEL_W, FILT_PANEL_TOP);
+    glVertex2f(FILT_PANEL_X, FILT_PANEL_TOP);
+    glEnd();
+    glDisable(GL_BLEND);
+
+    glColor3f(1.0f, 1.0f, 1.0f);
+    std::ostringstream title;
+    title << "Filters (" << total << ")";
+    drawText(FILT_PANEL_X + 0.02f, FILT_PANEL_TOP - 0.04f, title.str(), GLUT_BITMAP_HELVETICA_12);
+
+    drawButton(FILT_PANEL_X + 0.02f, FILT_PANEL_BOTTOM + 0.015f, 0.13f, 0.05f, "Up");
+    drawButton(FILT_PANEL_X + 0.17f, FILT_PANEL_BOTTOM + 0.015f, 0.13f, 0.05f, "Down");
+    {
+        std::ostringstream page;
+        int end = std::min(total, filterListScroll + visible);
+        page << (total == 0 ? 0 : filterListScroll + 1) << "-" << end;
+        glColor3f(0.75f, 0.75f, 0.85f);
+        drawText(FILT_PANEL_X + 0.32f, FILT_PANEL_BOTTOM + 0.03f, page.str());
+    }
+
+    float y = FILT_PANEL_TOP - 0.10f;
+    for (int row = 0; row < visible; ++row) {
+        int idx = filterListScroll + row;
+        if (idx >= total) break;
+        std::string label = std::to_string(idx + 1) + ". " + filters[idx]->name();
+        if (filters[idx]->enabled) label += " ON";
+        drawButton(FILT_PANEL_X + 0.02f, y - FILT_BTN_H, FILT_PANEL_W - 0.04f, FILT_BTN_H,
+                   label, false, filters[idx]->enabled);
+        y -= FILT_ROW_H;
+    }
+}
+
+bool hitTestFilterListPanel(float fx, float fy) {
+    if (fx < FILT_PANEL_X || fx > FILT_PANEL_X + FILT_PANEL_W ||
+        fy < FILT_PANEL_BOTTOM || fy > FILT_PANEL_TOP) {
+        return false;
+    }
+
+    clampFilterListScroll();
+    const int visible = filterListVisibleRows();
+    const int total = static_cast<int>(filters.size());
+
+    if (isInside(fx, fy, FILT_PANEL_X + 0.02f, FILT_PANEL_BOTTOM + 0.015f, 0.13f, 0.05f)) {
+        filterListScroll = std::max(0, filterListScroll - visible);
+        return true;
+    }
+    if (isInside(fx, fy, FILT_PANEL_X + 0.17f, FILT_PANEL_BOTTOM + 0.015f, 0.13f, 0.05f)) {
+        int maxScroll = std::max(0, total - visible);
+        filterListScroll = std::min(maxScroll, filterListScroll + visible);
+        return true;
+    }
+
+    float y = FILT_PANEL_TOP - 0.10f;
+    for (int row = 0; row < visible; ++row) {
+        int idx = filterListScroll + row;
+        if (idx >= total) break;
+        if (isInside(fx, fy, FILT_PANEL_X + 0.02f, y - FILT_BTN_H, FILT_PANEL_W - 0.04f, FILT_BTN_H)) {
+            filters[idx]->enabled = !filters[idx]->enabled;
+            if (filters[idx]->enabled)
+                activeSlider = idx * 3;
+            return true;
+        }
+        y -= FILT_ROW_H;
+    }
+    return true; // absorb clicks inside panel chrome
+}
+
 // Active-effects panel on the left — tall enough for multiple filter sliders.
 const float AE_PANEL_X = -0.95f;
 const float AE_PANEL_W = 0.48f;
@@ -1491,6 +1597,7 @@ void setControlFullscreen(bool enable);
 void applyVideoGeometry();
 bool hitTestPlacementPanel(float fx, float fy);
 bool hitTestGuidesPanel(float fx, float fy);
+bool hitTestFilterListPanel(float fx, float fy);
 
 void mouse(int button, int state, int x, int y) {
     if (!showUI || windowWidth < 1 || windowHeight < 1) return;
@@ -1514,6 +1621,21 @@ void mouse(int button, int state, int x, int y) {
             updatePieHover(fx, fy);
         }
         return;
+    }
+
+    // Mouse wheel over filter list (FreeGLUT: button 3=up, 4=down)
+    if ((button == 3 || button == 4) && state == GLUT_DOWN) {
+        if (fx >= FILT_PANEL_X && fx <= FILT_PANEL_X + FILT_PANEL_W &&
+            fy >= FILT_PANEL_BOTTOM && fy <= FILT_PANEL_TOP) {
+            clampFilterListScroll();
+            int visible = filterListVisibleRows();
+            int maxScroll = std::max(0, static_cast<int>(filters.size()) - visible);
+            if (button == 3)
+                filterListScroll = std::max(0, filterListScroll - 1);
+            else
+                filterListScroll = std::min(maxScroll, filterListScroll + 1);
+            return;
+        }
     }
 
     if (button != GLUT_LEFT_BUTTON) return;
@@ -1578,14 +1700,9 @@ void mouse(int button, int state, int x, int y) {
                 return;
             }
 
-            // Check filter toggles (updated y positions)
-            for (size_t i = 0; i < filters.size(); ++i) {
-                float bx = 0.6f * uiScale;
-                float by = -0.8f * uiScale + 0.15f * uiScale * i;
-                if (isInside(fx, fy, bx, by, 0.35f * uiScale, 0.08f * uiScale)) {
-                    filters[i]->enabled = !filters[i]->enabled;
-                    return;
-                }
+            // Scrollable filter list (right panel)
+            if (hitTestFilterListPanel(fx, fy)) {
+                return;
             }
 
             // Active Effects panel sliders (left side)
@@ -1779,6 +1896,18 @@ void keyboard(unsigned char key, int x, int y) {
         case 'h':
         case 'H':
             setControlFullscreen(!controlFullscreen);
+            break;
+        case ';':
+            clampFilterListScroll();
+            filterListScroll = std::max(0, filterListScroll - 1);
+            break;
+        case '\'':
+            {
+                clampFilterListScroll();
+                int visible = filterListVisibleRows();
+                int maxScroll = std::max(0, static_cast<int>(filters.size()) - visible);
+                filterListScroll = std::min(maxScroll, filterListScroll + 1);
+            }
             break;
         case 'u':
         case 'U':
@@ -2415,12 +2544,7 @@ void displayControlWindow() {
         drawButton(0.45f, -0.85f, 0.14f * uiScale, 0.08f * uiScale, "Vid FS", false, videoFullscreen);
         drawButton(0.62f, -0.85f, 0.14f * uiScale, 0.08f * uiScale, "Ctl FS", false, controlFullscreen);
 
-        for (size_t i = 0; i < filters.size(); ++i) {
-            float bx = 0.6f * uiScale;
-            float by = -0.8f * uiScale + 0.15f * uiScale * i;
-            std::string label = std::to_string(i + 1) + ". " + filters[i]->name() + (filters[i]->enabled ? " [ON]" : " [OFF]");
-            drawButton(bx, by, 0.35f * uiScale, 0.08f * uiScale, label, false, filters[i]->enabled);
-        }
+        drawFilterListPanel();
 
         drawViewControls();
         drawPlacementPanel();
