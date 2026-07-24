@@ -97,15 +97,15 @@ Toggle the same guides from the control panel **Calibration Guides** section.
 --fullscreen
 ```
 
-Filter enable flags: `anaglyph`, `anaglyphseq`, `motionpop`, `wavepop`, `gray`, `edge`, `sepia`, `pixelate`, `invert`, `blur`, `vignette`, `noise`, `colorbalance`, `scanlines`, `crt`, `glitch`, `kaleidoscope`, `nightvision`, `colorize`.
+Filter enable flags: `anaglyph`, `anaglyphseq`, `motionpop`, `enceladusvision` (aliases: `vision`, `wavepop`), `gray`, `edge`, `sepia`, `pixelate`, `invert`, `blur`, `vignette`, `noise`, `colorbalance`, `scanlines`, `crt`, `glitch`, `kaleidoscope`, `nightvision`, `colorize`.
 
 **Motion Pop 3D** (`--enable-motionpop`): tracks large moving regions over time and only pops objects that stay on screen long enough (~0.5–1.5s) and cover a meaningful part of the frame. Brief flicker / small motion is ignored. Sliders: Strictness (higher = fewer / harder-to-qualify pops), Pop Scale.
 
-**Wave Pop 3D** (`--enable-wavepop`): same persistent tracking as Motion Pop, but tracked regions extrude with a soft raised-cosine **wave** (elliptical mound) instead of a hard box. Default view keeps the video fully in-frame; raise **Orbit Pitch** / shift **Orbit Yaw** to inspect the 3D extrusion.
+**EnceladusVision** (`--enable-enceladusvision` / `--enable-wavepop`): soft raised-cosine wave extrusion on tracked regions (not hard boxes). Default view keeps video in-frame; orbit to inspect 3D. **Ana ON/OFF** toggles anaglyph; **Ana Amount** sets disparity when on. **Wave Lerp** eases waves in/out (0 = instant jump).
 
-Sliders: Strength, Strictness, Wave Soft, Wave Radius, Orbit Yaw, Orbit Pitch, Pop Scale (nonlinear — fine at low end, large at high), Hold Time, Anaglyph, **Size Depth** (larger tracks extrude farther), **Motion Point** (mound tips toward movement).
+Sliders: Strength, Strictness, Wave Soft, Wave Radius, Orbit Yaw/Pitch, Pop Scale, Hold Time, Ana Amount, Size Depth, Motion Point, Wave Lerp.
 
-Calibration tools (under the sliders): **Reset** (params + tracks + background model), **Front** (snap orbit), **Tracks** / **Motion** / **Height** overlays, **Relearn** (background only). Status line shows track counts. Scroll the Active Effects panel with the mouse wheel if needed.
+Calibration tools: Reset, Front, Ana ON/OFF, Tracks / Motion / Height overlays, Relearn.
 
 ### Controls
 

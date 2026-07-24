@@ -49,8 +49,8 @@ int controlSavedX = 920, controlSavedY = 80, controlSavedW = 960, controlSavedH 
 int windowWidth = 960, windowHeight = 720;
 float uiScale = 1.0f;
 int activeSlider = -1; // -1 means no slider is active
-// Encodes activeSlider as filterIdx * AE_SLIDER_STRIDE + paramType (0=strength .. 10=param10)
-const int AE_SLIDER_STRIDE = 11;
+// Encodes activeSlider as filterIdx * AE_SLIDER_STRIDE + paramType (0=strength .. 11=param11)
+const int AE_SLIDER_STRIDE = 12;
 float aePanelScroll = 0.0f; // scroll offset for tall Active Effects lists
 bool isSeeking = false;
 double videoDuration = 0;
@@ -160,6 +160,7 @@ public:
     virtual bool hasParam8() const { return false; }
     virtual bool hasParam9() const { return false; }
     virtual bool hasParam10() const { return false; }
+    virtual bool hasParam11() const { return false; }
     virtual std::string param1Name() const { return ""; }
     virtual std::string param2Name() const { return ""; }
     virtual std::string param3Name() const { return ""; }
@@ -170,6 +171,7 @@ public:
     virtual std::string param8Name() const { return ""; }
     virtual std::string param9Name() const { return ""; }
     virtual std::string param10Name() const { return ""; }
+    virtual std::string param11Name() const { return ""; }
     virtual bool hasReset() const { return false; }
     virtual void reset() {}
     // Optional calibration / tool buttons drawn under a filter's sliders
@@ -191,6 +193,7 @@ public:
     float param8 = 0.5f;
     float param9 = 0.5f;
     float param10 = 0.5f;
+    float param11 = 0.35f;
     virtual ~VideoFilter() = default;
 };
 
@@ -500,11 +503,9 @@ public:
     std::string param2Name() const override { return "Pop Scale"; }
 };
 
-// Soft wave extrusion of tracked regions on an otherwise flat, in-frame video plane.
-// Default camera is frontal (video fills the frame); orbit sliders tip the view to
-// inspect the 3D mound. Unlike Motion Pop's hard box, height uses a raised-cosine
-// wave over each track's ellipse.
-class WavePop3DFilter : public VideoFilter {
+// EnceladusVision: soft wave extrusion of tracked regions on an otherwise flat,
+// in-frame video plane. Orbit sliders tip the view to inspect 3D mounds.
+class EnceladusVisionFilter : public VideoFilter {
     struct Track {
         cv::Rect box;
         cv::Point2f center;
@@ -513,6 +514,7 @@ class WavePop3DFilter : public VideoFilter {
         float halfW = 40.0f;
         float halfH = 40.0f;
         float sizeNorm = 0.5f; // 0..1 relative to frame
+        float blend = 0.0f;    // smoothed wave presence 0..1
         int age = 0;
         int missed = 0;
     };
@@ -523,6 +525,7 @@ class WavePop3DFilter : public VideoFilter {
     bool showTracks = false;
     bool showMotion = false;
     bool showHeight = false;
+    bool anaglyphOn = true;
     static constexpr int kGrid = 80;
 
     struct Vert {
@@ -666,8 +669,36 @@ class WavePop3DFilter : public VideoFilter {
                 tr.vel *= 0.85f;
             }
         }
+
+        // param11 = Wave Lerp: 0 = instant jump, higher = smoother in/out
+        const int minAgeBlend = 4 + static_cast<int>((0.25f + param7 * 0.75f) * (8 + param1 * 20.0f));
+        const float lerpSlider = std::max(0.0f, std::min(1.0f, param11));
+        const float blendAlpha = (lerpSlider <= 0.001f)
+            ? 1.0f
+            : (0.018f + (1.0f - lerpSlider) * (1.0f - lerpSlider) * 0.55f);
+
+        for (auto& tr : tracks) {
+            float target = 0.0f;
+            if (tr.missed == 0) {
+                float maturity = std::min(1.0f, tr.age / static_cast<float>(std::max(1, minAgeBlend)));
+                if (tr.age >= minAgeBlend / 2)
+                    target = maturity;
+            }
+            if (blendAlpha >= 0.999f)
+                tr.blend = target;
+            else
+                tr.blend += (target - tr.blend) * blendAlpha;
+            if (tr.blend < 0.0f) tr.blend = 0.0f;
+            if (tr.blend > 1.0f) tr.blend = 1.0f;
+        }
+
         tracks.erase(std::remove_if(tracks.begin(), tracks.end(),
-                                    [&](const Track& t) { return t.missed > maxMissed; }),
+                                    [&](const Track& t) {
+                                        if (t.missed <= maxMissed) return false;
+                                        // Keep fading tracks while blend remains visible
+                                        if (lerpSlider > 0.001f && t.blend > 0.02f) return false;
+                                        return true;
+                                    }),
                      tracks.end());
         for (size_t i = 0; i < detections.size(); ++i) {
             if (used[i]) continue;
@@ -680,6 +711,7 @@ class WavePop3DFilter : public VideoFilter {
             t.halfH = detections[i].halfH;
             float rel = static_cast<float>(std::sqrt(detections[i].area / std::max(1.0, frameArea)));
             t.sizeNorm = std::max(0.0f, std::min(1.0f, rel / 0.42f));
+            t.blend = (lerpSlider <= 0.001f) ? 0.0f : 0.0f; // starts at 0, lerps up
             t.age = 1;
             t.missed = 0;
             tracks.push_back(t);
@@ -702,7 +734,6 @@ class WavePop3DFilter : public VideoFilter {
 
     // Raised-cosine mound; depth scales with track size; tips toward motion.
     WaveSample sampleWave(float u, float v, int frameW, int frameH) const {
-        const int minAge = 4 + static_cast<int>((0.25f + param7 * 0.75f) * (8 + param1 * 20.0f));
         const float radiusMul = 0.7f + param3 * 1.5f;
         const float softPow = 0.35f + param2 * 1.8f;
         const float pop = popScaleCurve(param6);
@@ -714,8 +745,7 @@ class WavePop3DFilter : public VideoFilter {
         WaveSample best;
         float bestW = 0.0f;
         for (const auto& tr : tracks) {
-            if (tr.age < minAge / 2) continue;
-            float maturity = std::min(1.0f, tr.age / static_cast<float>(std::max(1, minAge)));
+            if (tr.blend < 0.01f) continue;
             float cu = tr.center.x / std::max(1, frameW - 1);
             float cv = tr.center.y / std::max(1, frameH - 1);
             float rx = std::max(0.03f, (tr.halfW / std::max(1, frameW - 1)) * radiusMul);
@@ -730,7 +760,8 @@ class WavePop3DFilter : public VideoFilter {
 
             // Larger tracks push farther out of the screen; small tracks stay subtle
             float sizeDepth = (1.0f - 0.75f * sizeAmt) + tr.sizeNorm * (1.55f * sizeAmt);
-            float h = wave * maturity * baseAmp * sizeDepth;
+            // blend = smoothed presence (Wave Lerp); replaces hard maturity jump
+            float h = wave * tr.blend * baseAmp * sizeDepth;
 
             // Tip / point the mound along smoothed velocity (leading edge rises ahead)
             float speed = std::sqrt(tr.vel.x * tr.vel.x + tr.vel.y * tr.vel.y);
@@ -743,14 +774,14 @@ class WavePop3DFilter : public VideoFilter {
                 float along = nx * dirU * (rx / std::max(rx, ry)) + ny * dirV * (ry / std::max(rx, ry));
                 float tip = 0.5f + 0.5f * along; // higher on leading side
                 h *= (1.0f - 0.35f * pointAmt) + tip * (0.7f * pointAmt);
-                lean = pointAmt * wave * maturity * std::min(1.0f, speed / (0.02f * diag)) * h;
+                lean = pointAmt * wave * tr.blend * std::min(1.0f, speed / (0.02f * diag)) * h;
                 // World X follows image X; world Y is up so flip image V
                 ldx = dirU * lean * 1.15f;
                 ldy = -dirV * lean * 1.15f;
             }
 
-            if (wave * maturity >= bestW) {
-                bestW = wave * maturity;
+            if (wave * tr.blend >= bestW) {
+                bestW = wave * tr.blend;
                 best.h = h;
                 best.ox = ldx;
                 best.oy = ldy;
@@ -925,11 +956,11 @@ public:
         else
             output = small;
 
-        // Soft anaglyph from the same wave height (param8 = anaglyph amount)
+        // Soft anaglyph (toggle + amount slider)
         cv::Mat heightMap = buildHeightMap(frame.rows, frame.cols);
         double minV = 0, maxV = 0;
         cv::minMaxLoc(heightMap, &minV, &maxV);
-        if (maxV > 0.02 && param8 > 0.05f)
+        if (anaglyphOn && maxV > 0.02 && param8 > 0.05f)
             output = applyAnaglyph(output, heightMap);
 
         // Calibration overlays (drawn in image space; helpful while tuning)
@@ -975,16 +1006,18 @@ public:
 
     void applyDefaultParams() {
         strength = 0.85f;
-        param1 = 0.35f; // Strictness
-        param2 = 0.45f; // Wave Soft
-        param3 = 0.65f; // Wave Radius
-        param4 = 0.5f;  // Orbit Yaw
-        param5 = 0.0f;  // Orbit Pitch
-        param6 = 0.55f; // Pop Scale (nonlinear; mid still moderate)
-        param7 = 0.4f;  // Hold Time
-        param8 = 0.55f; // Anaglyph
-        param9 = 0.65f; // Size Depth
+        param1 = 0.35f;  // Strictness
+        param2 = 0.45f;  // Wave Soft
+        param3 = 0.65f;  // Wave Radius
+        param4 = 0.5f;   // Orbit Yaw
+        param5 = 0.0f;   // Orbit Pitch
+        param6 = 0.55f;  // Pop Scale
+        param7 = 0.4f;   // Hold Time
+        param8 = 0.55f;  // Ana Amount
+        param9 = 0.65f;  // Size Depth
         param10 = 0.55f; // Motion Point
+        param11 = 0.4f;  // Wave Lerp (0 = instant)
+        anaglyphOn = true;
     }
 
     void resetTracking() {
@@ -1001,7 +1034,7 @@ public:
         showHeight = false;
     }
 
-    std::string name() const override { return "Wave Pop 3D"; }
+    std::string name() const override { return "EnceladusVision"; }
     bool hasParam1() const override { return true; }
     bool hasParam2() const override { return true; }
     bool hasParam3() const override { return true; }
@@ -1012,6 +1045,7 @@ public:
     bool hasParam8() const override { return true; }
     bool hasParam9() const override { return true; }
     bool hasParam10() const override { return true; }
+    bool hasParam11() const override { return true; }
     std::string param1Name() const override { return "Strictness"; }
     std::string param2Name() const override { return "Wave Soft"; }
     std::string param3Name() const override { return "Wave Radius"; }
@@ -1019,39 +1053,43 @@ public:
     std::string param5Name() const override { return "Orbit Pitch"; }
     std::string param6Name() const override { return "Pop Scale"; }
     std::string param7Name() const override { return "Hold Time"; }
-    std::string param8Name() const override { return "Anaglyph"; }
+    std::string param8Name() const override { return "Ana Amount"; }
     std::string param9Name() const override { return "Size Depth"; }
     std::string param10Name() const override { return "Motion Point"; }
+    std::string param11Name() const override { return "Wave Lerp"; }
     bool hasReset() const override { return true; }
 
-    int toolButtonCount() const override { return 6; }
+    int toolButtonCount() const override { return 7; }
     std::string toolButtonName(int i) const override {
         switch (i) {
             case 0: return "Reset";
             case 1: return "Front";
-            case 2: return "Tracks";
-            case 3: return "Motion";
-            case 4: return "Height";
-            case 5: return "Relearn";
+            case 2: return anaglyphOn ? "Ana ON" : "Ana OFF";
+            case 3: return "Tracks";
+            case 4: return "Motion";
+            case 5: return "Height";
+            case 6: return "Relearn";
             default: return "";
         }
     }
     bool toolButtonActive(int i) const override {
         switch (i) {
-            case 2: return showTracks;
-            case 3: return showMotion;
-            case 4: return showHeight;
+            case 2: return anaglyphOn;
+            case 3: return showTracks;
+            case 4: return showMotion;
+            case 5: return showHeight;
             default: return false;
         }
     }
     void toolButtonClick(int i) override {
         switch (i) {
             case 0: reset(); break;
-            case 1: param4 = 0.5f; param5 = 0.0f; break; // snap orbit frontal
-            case 2: showTracks = !showTracks; break;
-            case 3: showMotion = !showMotion; break;
-            case 4: showHeight = !showHeight; break;
-            case 5: resetTracking(); break; // relearn background only
+            case 1: param4 = 0.5f; param5 = 0.0f; break;
+            case 2: anaglyphOn = !anaglyphOn; break;
+            case 3: showTracks = !showTracks; break;
+            case 4: showMotion = !showMotion; break;
+            case 5: showHeight = !showHeight; break;
+            case 6: resetTracking(); break;
             default: break;
         }
     }
@@ -1059,10 +1097,11 @@ public:
         int mature = 0;
         const int minAge = 4 + static_cast<int>((0.25f + param7 * 0.75f) * (8 + param1 * 20.0f));
         for (const auto& tr : tracks)
-            if (tr.age >= minAge) ++mature;
+            if (tr.blend > 0.5f || tr.age >= minAge) ++mature;
+        std::string ana = anaglyphOn ? "ana on" : "ana off";
         return "tracks " + std::to_string(tracks.size()) +
-               "  mature " + std::to_string(mature) +
-               "  need " + std::to_string(minAge) + "f";
+               "  live " + std::to_string(mature) +
+               "  " + ana;
     }
 };
 
@@ -2125,6 +2164,7 @@ float activeEffectsContentHeight() {
         if (filter->hasParam8()) h += AE_SLIDER_STEP;
         if (filter->hasParam9()) h += AE_SLIDER_STEP;
         if (filter->hasParam10()) h += AE_SLIDER_STEP;
+        if (filter->hasParam11()) h += AE_SLIDER_STEP;
         int tools = filter->toolButtonCount();
         if (tools > 0) {
             int rows = (tools + 1) / 2;
@@ -2210,6 +2250,7 @@ void drawActiveEffectsPanel() {
         if (filters[i]->hasParam8()) drawParam(filters[i]->param8, filters[i]->param8Name());
         if (filters[i]->hasParam9()) drawParam(filters[i]->param9, filters[i]->param9Name());
         if (filters[i]->hasParam10()) drawParam(filters[i]->param10, filters[i]->param10Name());
+        if (filters[i]->hasParam11()) drawParam(filters[i]->param11, filters[i]->param11Name());
 
         int tools = filters[i]->toolButtonCount();
         if (tools > 0) {
@@ -2281,6 +2322,7 @@ bool hitTestActiveEffectsSliders(float fx, float fy) {
         if (filters[i]->hasParam8() && trySlider(8, filters[i]->param8)) return true;
         if (filters[i]->hasParam9() && trySlider(9, filters[i]->param9)) return true;
         if (filters[i]->hasParam10() && trySlider(10, filters[i]->param10)) return true;
+        if (filters[i]->hasParam11() && trySlider(11, filters[i]->param11)) return true;
 
         int tools = filters[i]->toolButtonCount();
         if (tools > 0) {
@@ -2830,6 +2872,7 @@ void mouseMotion(int x, int y) {
         case 8: filters[filterIdx]->param8 = normalizedValue; break;
         case 9: filters[filterIdx]->param9 = normalizedValue; break;
         case 10: filters[filterIdx]->param10 = normalizedValue; break;
+        case 11: filters[filterIdx]->param11 = normalizedValue; break;
     }
 
     glutPostRedisplay();
@@ -2960,6 +3003,7 @@ void keyboard(unsigned char key, int x, int y) {
                     case 8: filters[filterIdx]->param8 = std::max(0.0f, filters[filterIdx]->param8 - step); break;
                     case 9: filters[filterIdx]->param9 = std::max(0.0f, filters[filterIdx]->param9 - step); break;
                     case 10: filters[filterIdx]->param10 = std::max(0.0f, filters[filterIdx]->param10 - step); break;
+                    case 11: filters[filterIdx]->param11 = std::max(0.0f, filters[filterIdx]->param11 - step); break;
                 }
             } else {
                 videoScale = std::max(VIDEO_SCALE_MIN, videoScale - 0.05f);
@@ -2983,6 +3027,7 @@ void keyboard(unsigned char key, int x, int y) {
                     case 8: filters[filterIdx]->param8 = std::min(1.0f, filters[filterIdx]->param8 + step); break;
                     case 9: filters[filterIdx]->param9 = std::min(1.0f, filters[filterIdx]->param9 + step); break;
                     case 10: filters[filterIdx]->param10 = std::min(1.0f, filters[filterIdx]->param10 + step); break;
+                    case 11: filters[filterIdx]->param11 = std::min(1.0f, filters[filterIdx]->param11 + step); break;
                 }
             } else {
                 videoScale = std::min(VIDEO_SCALE_MAX, videoScale + 0.05f);
@@ -3842,11 +3887,12 @@ int main(int argc, char** argv) {
     motionPop->param2 = 0.45f;
     filters.push_back(std::move(motionPop));
 
-    auto wavePop = std::make_unique<WavePop3DFilter>();
-    wavePop->enabled = enabled.count("wavepop") || enabled.count("wave-pop") ||
-                       enabled.count("wave3d");
-    wavePop->applyDefaultParams();
-    filters.push_back(std::move(wavePop));
+    auto vision = std::make_unique<EnceladusVisionFilter>();
+    vision->enabled = enabled.count("enceladusvision") || enabled.count("vision") ||
+                      enabled.count("wavepop") || enabled.count("wave-pop") ||
+                      enabled.count("wave3d");
+    vision->applyDefaultParams();
+    filters.push_back(std::move(vision));
 
     auto gray = std::make_unique<GrayscaleFilter>();
     gray->enabled = enabled.count("gray");
