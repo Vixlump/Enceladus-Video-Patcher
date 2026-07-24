@@ -16,6 +16,9 @@
 #include <random>
 #include <algorithm>
 #include <cctype>
+#include <filesystem>
+#include <fstream>
+#include <cstdlib>
 
 // Global variables
 cv::Mat latestFrame;
@@ -53,6 +56,21 @@ float videoOffsetY = 0.0f;
 int activeViewSlider = -1; // 0=scale, 1=posX, 2=posY
 const float VIDEO_SCALE_MIN = 0.2f;
 const float VIDEO_SCALE_MAX = 2.0f;
+
+// Source picker menus (file browser / webcam list)
+enum class SourceMenuMode { None, Files, Cameras };
+SourceMenuMode sourceMenuMode = SourceMenuMode::None;
+std::string browserPath;
+std::vector<std::pair<std::string, bool>> browserEntries; // name, isDirectory
+int browserScroll = 0;
+struct CameraDevice {
+    int index;
+    std::string label;
+};
+std::vector<CameraDevice> cameraDevices;
+int cameraScroll = 0;
+const int SOURCE_MENU_ROWS = 12;
+namespace fs = std::filesystem;
 
 // Colors
 struct Color {
@@ -647,14 +665,377 @@ bool openVideoSource(const std::string& source) {
     return cap.open(source);
 }
 
+bool isVideoExtension(const std::string& ext) {
+    static const std::unordered_set<std::string> kVideoExt = {
+        ".mp4", ".avi", ".mkv", ".mov", ".webm", ".m4v",
+        ".wmv", ".flv", ".mpg", ".mpeg", ".m2ts", ".ts", ".3gp"
+    };
+    std::string e = ext;
+    std::transform(e.begin(), e.end(), e.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return kVideoExt.count(e) > 0;
+}
+
+std::string truncateLabel(const std::string& s, size_t maxLen) {
+    if (s.size() <= maxLen) return s;
+    if (maxLen <= 3) return s.substr(0, maxLen);
+    return s.substr(0, maxLen - 3) + "...";
+}
+
+void refreshBrowserEntries() {
+    browserEntries.clear();
+    std::error_code ec;
+    if (browserPath.empty()) {
+        const char* home = std::getenv("HOME");
+        browserPath = home ? home : ".";
+    }
+    fs::path path(browserPath);
+    if (!fs::exists(path, ec) || !fs::is_directory(path, ec)) {
+        const char* home = std::getenv("HOME");
+        browserPath = home ? home : ".";
+        path = browserPath;
+    }
+    browserPath = fs::weakly_canonical(path, ec).string();
+    if (ec) browserPath = path.string();
+
+    std::vector<std::pair<std::string, bool>> dirs;
+    std::vector<std::pair<std::string, bool>> files;
+    for (fs::directory_iterator it(path, fs::directory_options::skip_permission_denied, ec), end;
+         it != end; it.increment(ec)) {
+        if (ec) { ec.clear(); continue; }
+        const auto& entry = *it;
+        std::string name = entry.path().filename().string();
+        if (name.empty() || name[0] == '.') continue;
+        std::error_code sec;
+        if (entry.is_directory(sec)) {
+            dirs.push_back({name, true});
+        } else if (entry.is_regular_file(sec) && isVideoExtension(entry.path().extension().string())) {
+            files.push_back({name, false});
+        }
+    }
+    std::sort(dirs.begin(), dirs.end());
+    std::sort(files.begin(), files.end());
+    browserEntries = std::move(dirs);
+    browserEntries.insert(browserEntries.end(), files.begin(), files.end());
+    browserScroll = std::max(0, std::min(browserScroll,
+        std::max(0, static_cast<int>(browserEntries.size()) - SOURCE_MENU_ROWS)));
+}
+
+void scanCameras() {
+    cameraDevices.clear();
+
+    // Prefer sysfs enumeration so we don't interrupt the active capture device.
+    bool foundSysfs = false;
+    for (int i = 0; i < 10; ++i) {
+        std::string sysDir = "/sys/class/video4linux/video" + std::to_string(i);
+        if (!fs::exists(sysDir)) continue;
+        foundSysfs = true;
+
+        std::string label = "Camera " + std::to_string(i);
+        std::ifstream nameFile(sysDir + "/name");
+        if (nameFile) {
+            std::string deviceName;
+            std::getline(nameFile, deviceName);
+            if (!deviceName.empty())
+                label += ": " + deviceName;
+        }
+        cameraDevices.push_back({i, label});
+    }
+
+    // Fallback: probe indices if sysfs is unavailable
+    if (!foundSysfs) {
+        std::string currentSource;
+        bool restore = cap.isOpened() && !playlist.empty();
+        if (restore) {
+            currentSource = playlist[currentVideoIndex];
+            cap.release();
+        }
+        for (int i = 0; i < 10; ++i) {
+            cv::VideoCapture test;
+            bool ok = test.open(i, cv::CAP_V4L2) || test.open(i, cv::CAP_ANY);
+            if (!ok) continue;
+            test.release();
+            cameraDevices.push_back({i, "Camera " + std::to_string(i)});
+        }
+        if (restore)
+            openVideoSource(currentSource);
+    }
+
+    cameraScroll = std::max(0, std::min(cameraScroll,
+        std::max(0, static_cast<int>(cameraDevices.size()) - SOURCE_MENU_ROWS)));
+}
+
+bool switchToSource(const std::string& source) {
+    cap.release();
+    auto it = std::find(playlist.begin(), playlist.end(), source);
+    if (it != playlist.end()) {
+        currentVideoIndex = static_cast<int>(it - playlist.begin());
+    } else {
+        playlist.push_back(source);
+        currentVideoIndex = static_cast<int>(playlist.size()) - 1;
+    }
+
+    if (!openVideoSource(source)) {
+        std::cerr << "Failed to open source: " << source << std::endl;
+        return false;
+    }
+
+    double fps = cap.get(cv::CAP_PROP_FPS);
+    double frames = cap.get(cv::CAP_PROP_FRAME_COUNT);
+    if (fps > 1e-3 && frames > 0)
+        videoDuration = frames / fps;
+    else
+        videoDuration = 0.0;
+    currentVideoTime = 0.0;
+    lastFrameTime = glutGet(GLUT_ELAPSED_TIME) / 1000.0;
+    latestFrame.release();
+    isPaused = false;
+    frameAvailable = true;
+    return true;
+}
+
+void openFileBrowserMenu() {
+    showPieMenu = false;
+    pieHoverIndex = -1;
+    sourceMenuMode = SourceMenuMode::Files;
+    if (browserPath.empty()) {
+        const char* home = std::getenv("HOME");
+        browserPath = home ? home : ".";
+    }
+    browserScroll = 0;
+    refreshBrowserEntries();
+}
+
+void openCameraMenu() {
+    showPieMenu = false;
+    pieHoverIndex = -1;
+    sourceMenuMode = SourceMenuMode::Cameras;
+    cameraScroll = 0;
+    scanCameras();
+}
+
+void closeSourceMenu() {
+    sourceMenuMode = SourceMenuMode::None;
+}
+
+void drawText(float x, float y, const std::string& text, void* font = GLUT_BITMAP_HELVETICA_12);
+void drawButton(float x, float y, float w, float h, const std::string& label, bool hover = false, bool active = false);
+bool isInside(float mx, float my, float x, float y, float w, float h);
+
+void drawSourceMenu() {
+    if (sourceMenuMode == SourceMenuMode::None) return;
+
+    const float x = -0.55f;
+    const float y = -0.55f;
+    const float w = 1.10f;
+    const float h = 1.15f;
+    const float rowH = 0.07f;
+    const float listTop = y + h - 0.18f;
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glColor4f(0.0f, 0.0f, 0.0f, 0.45f);
+    glBegin(GL_QUADS);
+    glVertex2f(-1.0f, -1.0f);
+    glVertex2f( 1.0f, -1.0f);
+    glVertex2f( 1.0f,  1.0f);
+    glVertex2f(-1.0f,  1.0f);
+    glEnd();
+
+    glColor4f(0.10f, 0.10f, 0.14f, 0.96f);
+    glBegin(GL_QUADS);
+    glVertex2f(x, y);
+    glVertex2f(x + w, y);
+    glVertex2f(x + w, y + h);
+    glVertex2f(x, y + h);
+    glEnd();
+    glColor4f(0.40f, 0.40f, 0.50f, 1.0f);
+    glLineWidth(2.0f);
+    glBegin(GL_LINE_LOOP);
+    glVertex2f(x, y);
+    glVertex2f(x + w, y);
+    glVertex2f(x + w, y + h);
+    glVertex2f(x, y + h);
+    glEnd();
+    glDisable(GL_BLEND);
+
+    if (sourceMenuMode == SourceMenuMode::Files) {
+        glColor3f(1.0f, 1.0f, 1.0f);
+        drawText(x + 0.03f, y + h - 0.05f, "Open Video File", GLUT_BITMAP_HELVETICA_18);
+        drawText(x + 0.03f, y + h - 0.11f,
+                 truncateLabel(browserPath, 70), GLUT_BITMAP_HELVETICA_12);
+
+        drawButton(x + 0.03f, y + 0.03f, 0.16f, 0.06f, "Up");
+        drawButton(x + 0.22f, y + 0.03f, 0.16f, 0.06f, "Home");
+        drawButton(x + 0.41f, y + 0.03f, 0.16f, 0.06f, "Refresh");
+        drawButton(x + w - 0.35f, y + 0.03f, 0.14f, 0.06f, "Prev");
+        drawButton(x + w - 0.19f, y + 0.03f, 0.14f, 0.06f, "Next");
+        drawButton(x + w - 0.19f, y + h - 0.08f, 0.14f, 0.06f, "Close");
+
+        int total = static_cast<int>(browserEntries.size());
+        if (total == 0) {
+            glColor3f(0.7f, 0.7f, 0.75f);
+            drawText(x + 0.05f, listTop, "No folders or video files here.");
+        }
+        for (int i = 0; i < SOURCE_MENU_ROWS; ++i) {
+            int idx = browserScroll + i;
+            if (idx >= total) break;
+            float rowY = listTop - i * rowH;
+            bool isDir = browserEntries[idx].second;
+            glColor3f(isDir ? 0.18f : 0.16f, isDir ? 0.22f : 0.16f, isDir ? 0.30f : 0.20f);
+            glBegin(GL_QUADS);
+            glVertex2f(x + 0.03f, rowY - 0.015f);
+            glVertex2f(x + w - 0.03f, rowY - 0.015f);
+            glVertex2f(x + w - 0.03f, rowY + 0.045f);
+            glVertex2f(x + 0.03f, rowY + 0.045f);
+            glEnd();
+            glColor3f(isDir ? 0.75f : 0.95f, isDir ? 0.85f : 0.95f, 1.0f);
+            std::string prefix = isDir ? "[DIR] " : "      ";
+            drawText(x + 0.05f, rowY, truncateLabel(prefix + browserEntries[idx].first, 60));
+        }
+    } else {
+        glColor3f(1.0f, 1.0f, 1.0f);
+        drawText(x + 0.03f, y + h - 0.05f, "Select Webcam", GLUT_BITMAP_HELVETICA_18);
+        drawText(x + 0.03f, y + h - 0.11f,
+                 std::to_string(cameraDevices.size()) + " device(s) found",
+                 GLUT_BITMAP_HELVETICA_12);
+
+        drawButton(x + 0.03f, y + 0.03f, 0.20f, 0.06f, "Refresh");
+        drawButton(x + w - 0.35f, y + 0.03f, 0.14f, 0.06f, "Prev");
+        drawButton(x + w - 0.19f, y + 0.03f, 0.14f, 0.06f, "Next");
+        drawButton(x + w - 0.19f, y + h - 0.08f, 0.14f, 0.06f, "Close");
+
+        int total = static_cast<int>(cameraDevices.size());
+        if (total == 0) {
+            glColor3f(0.7f, 0.7f, 0.75f);
+            drawText(x + 0.05f, listTop, "No webcams detected.");
+        }
+        for (int i = 0; i < SOURCE_MENU_ROWS; ++i) {
+            int idx = cameraScroll + i;
+            if (idx >= total) break;
+            float rowY = listTop - i * rowH;
+            glColor3f(0.16f, 0.22f, 0.18f);
+            glBegin(GL_QUADS);
+            glVertex2f(x + 0.03f, rowY - 0.015f);
+            glVertex2f(x + w - 0.03f, rowY - 0.015f);
+            glVertex2f(x + w - 0.03f, rowY + 0.045f);
+            glVertex2f(x + 0.03f, rowY + 0.045f);
+            glEnd();
+            glColor3f(0.9f, 1.0f, 0.9f);
+            drawText(x + 0.05f, rowY, truncateLabel(cameraDevices[idx].label, 60));
+        }
+    }
+}
+
+bool hitTestSourceMenu(float fx, float fy) {
+    if (sourceMenuMode == SourceMenuMode::None) return false;
+
+    const float x = -0.55f;
+    const float y = -0.55f;
+    const float w = 1.10f;
+    const float h = 1.15f;
+    const float rowH = 0.07f;
+    const float listTop = y + h - 0.18f;
+
+    // Absorb clicks on the dimmed backdrop; only Close dismisses from chrome
+    if (!(fx >= x && fx <= x + w && fy >= y && fy <= y + h)) {
+        closeSourceMenu();
+        return true;
+    }
+
+    if (isInside(fx, fy, x + w - 0.19f, y + h - 0.08f, 0.14f, 0.06f)) {
+        closeSourceMenu();
+        return true;
+    }
+
+    if (sourceMenuMode == SourceMenuMode::Files) {
+        if (isInside(fx, fy, x + 0.03f, y + 0.03f, 0.16f, 0.06f)) {
+            fs::path parent = fs::path(browserPath).parent_path();
+            if (!parent.empty()) {
+                browserPath = parent.string();
+                browserScroll = 0;
+                refreshBrowserEntries();
+            }
+            return true;
+        }
+        if (isInside(fx, fy, x + 0.22f, y + 0.03f, 0.16f, 0.06f)) {
+            const char* home = std::getenv("HOME");
+            browserPath = home ? home : ".";
+            browserScroll = 0;
+            refreshBrowserEntries();
+            return true;
+        }
+        if (isInside(fx, fy, x + 0.41f, y + 0.03f, 0.16f, 0.06f)) {
+            refreshBrowserEntries();
+            return true;
+        }
+        if (isInside(fx, fy, x + w - 0.35f, y + 0.03f, 0.14f, 0.06f)) {
+            browserScroll = std::max(0, browserScroll - SOURCE_MENU_ROWS);
+            return true;
+        }
+        if (isInside(fx, fy, x + w - 0.19f, y + 0.03f, 0.14f, 0.06f)) {
+            int maxScroll = std::max(0, static_cast<int>(browserEntries.size()) - SOURCE_MENU_ROWS);
+            browserScroll = std::min(maxScroll, browserScroll + SOURCE_MENU_ROWS);
+            return true;
+        }
+
+        int total = static_cast<int>(browserEntries.size());
+        for (int i = 0; i < SOURCE_MENU_ROWS; ++i) {
+            int idx = browserScroll + i;
+            if (idx >= total) break;
+            float rowY = listTop - i * rowH;
+            if (isInside(fx, fy, x + 0.03f, rowY - 0.015f, w - 0.06f, 0.06f)) {
+                const auto& entry = browserEntries[idx];
+                if (entry.second) {
+                    browserPath = (fs::path(browserPath) / entry.first).string();
+                    browserScroll = 0;
+                    refreshBrowserEntries();
+                } else {
+                    std::string full = (fs::path(browserPath) / entry.first).string();
+                    if (switchToSource(full))
+                        closeSourceMenu();
+                }
+                return true;
+            }
+        }
+    } else {
+        if (isInside(fx, fy, x + 0.03f, y + 0.03f, 0.20f, 0.06f)) {
+            scanCameras();
+            return true;
+        }
+        if (isInside(fx, fy, x + w - 0.35f, y + 0.03f, 0.14f, 0.06f)) {
+            cameraScroll = std::max(0, cameraScroll - SOURCE_MENU_ROWS);
+            return true;
+        }
+        if (isInside(fx, fy, x + w - 0.19f, y + 0.03f, 0.14f, 0.06f)) {
+            int maxScroll = std::max(0, static_cast<int>(cameraDevices.size()) - SOURCE_MENU_ROWS);
+            cameraScroll = std::min(maxScroll, cameraScroll + SOURCE_MENU_ROWS);
+            return true;
+        }
+
+        int total = static_cast<int>(cameraDevices.size());
+        for (int i = 0; i < SOURCE_MENU_ROWS; ++i) {
+            int idx = cameraScroll + i;
+            if (idx >= total) break;
+            float rowY = listTop - i * rowH;
+            if (isInside(fx, fy, x + 0.03f, rowY - 0.015f, w - 0.06f, 0.06f)) {
+                if (switchToSource(std::to_string(cameraDevices[idx].index)))
+                    closeSourceMenu();
+                return true;
+            }
+        }
+    }
+    return true; // consume clicks inside panel
+}
+
 // Utility functions
-void drawText(float x, float y, const std::string& text, void* font = GLUT_BITMAP_HELVETICA_12) {
+void drawText(float x, float y, const std::string& text, void* font) {
     glRasterPos2f(x, y);
     for (char c : text)
         glutBitmapCharacter(font, c);
 }
 
-void drawButton(float x, float y, float w, float h, const std::string& label, bool hover = false, bool active = false) {
+void drawButton(float x, float y, float w, float h, const std::string& label, bool hover, bool active) {
     if (active) {
         glColor3f(buttonActiveColor.r, buttonActiveColor.g, buttonActiveColor.b);
     } else if (hover) {
@@ -677,7 +1058,6 @@ void drawButton(float x, float y, float w, float h, const std::string& label, bo
 }
 
 void drawSlider(float x, float y, float w, float h, float value, const std::string& label);
-bool isInside(float mx, float my, float x, float y, float w, float h);
 
 // Active-effects panel sits on the left so sliders never overlap the filter buttons.
 const float AE_PANEL_X = -0.95f;
@@ -1058,13 +1438,17 @@ bool hitTestViewControls(float fx, float fy) {
 }
 
 void mouse(int button, int state, int x, int y) {
-    if (!showUI) return;
+    if (!showUI || windowWidth < 1 || windowHeight < 1) return;
 
     float fx = (float)x / windowWidth * 2.0f - 1.0f;
     float fy = 1.0f - (float)y / windowHeight * 2.0f;
 
     // Right-click toggles pie menu (also closes if already open)
     if (button == GLUT_RIGHT_BUTTON && state == GLUT_DOWN) {
+        if (sourceMenuMode != SourceMenuMode::None) {
+            closeSourceMenu();
+            return;
+        }
         if (showPieMenu) {
             showPieMenu = false;
             pieHoverIndex = -1;
@@ -1083,6 +1467,12 @@ void mouse(int button, int state, int x, int y) {
         mouseLeftDown = (state == GLUT_DOWN);
 
         if (state == GLUT_DOWN) {
+            // Source menus capture input while open
+            if (sourceMenuMode != SourceMenuMode::None) {
+                hitTestSourceMenu(fx, fy);
+                return;
+            }
+
             // Check progress bar for seeking
             if (isInside(fx, fy, -0.95f, -0.95f, 1.9f, 0.03f * uiScale)) {
                 isSeeking = true;
@@ -1114,6 +1504,14 @@ void mouse(int button, int state, int x, int y) {
                 if (cap.isOpened()) {
                     videoDuration = cap.get(cv::CAP_PROP_FRAME_COUNT) / cap.get(cv::CAP_PROP_FPS);
                 }
+                return;
+            }
+            else if (isInside(fx, fy, 0.05f, -0.85f, 0.15f * uiScale, 0.08f * uiScale)) {
+                openFileBrowserMenu();
+                return;
+            }
+            else if (isInside(fx, fy, 0.25f, -0.85f, 0.15f * uiScale, 0.08f * uiScale)) {
+                openCameraMenu();
                 return;
             }
             else if (isInside(fx, fy, 0.8f, -0.85f, 0.15f * uiScale, 0.08f * uiScale)) {
@@ -1202,6 +1600,7 @@ void mouse(int button, int state, int x, int y) {
 }
 
 void mouseMotion(int x, int y) {
+    if (windowWidth < 1 || windowHeight < 1) return;
     float fx = (float)x / windowWidth * 2.0f - 1.0f;
     float fy = 1.0f - (float)y / windowHeight * 2.0f;
 
@@ -1251,6 +1650,7 @@ void mouseMotion(int x, int y) {
 }
 
 void passiveMouseMotion(int x, int y) {
+    if (windowWidth < 1 || windowHeight < 1) return;
     float fx = (float)x / windowWidth * 2.0f - 1.0f;
     float fy = 1.0f - (float)y / windowHeight * 2.0f;
     int prev = pieHoverIndex;
@@ -1262,7 +1662,9 @@ void passiveMouseMotion(int x, int y) {
 void keyboard(unsigned char key, int x, int y) {
     switch (key) {
         case 27: // ESC
-            if (showPieMenu) {
+            if (sourceMenuMode != SourceMenuMode::None) {
+                closeSourceMenu();
+            } else if (showPieMenu) {
                 showPieMenu = false;
             } else if (fullscreen) {
                 fullscreen = false;
@@ -1301,11 +1703,25 @@ void keyboard(unsigned char key, int x, int y) {
         case 'U':
             showUI = !showUI;
             break;
+        case 'v':
+        case 'V':
+            openFileBrowserMenu();
+            break;
+        case 'c':
+        case 'C':
+            openCameraMenu();
+            break;
         case 'r':
         case 'R':
-            videoScale = 1.0f;
-            videoOffsetX = 0.0f;
-            videoOffsetY = 0.0f;
+            if (sourceMenuMode == SourceMenuMode::Files) {
+                refreshBrowserEntries();
+            } else if (sourceMenuMode == SourceMenuMode::Cameras) {
+                scanCameras();
+            } else {
+                videoScale = 1.0f;
+                videoOffsetX = 0.0f;
+                videoOffsetY = 0.0f;
+            }
             break;
         case 'o':
         case 'O':
@@ -1392,47 +1808,85 @@ void keyboard(unsigned char key, int x, int y) {
 }
 
 void displayVideoFrame(const cv::Mat& frame) {
-    if (frame.empty()) return;
+    if (frame.empty() || windowWidth < 1 || windowHeight < 1) return;
+    if (frame.cols < 1 || frame.rows < 1) return;
 
     cv::Mat rgb;
-    cv::cvtColor(frame, rgb, cv::COLOR_BGR2RGB);
+    try {
+        if (frame.channels() == 1)
+            cv::cvtColor(frame, rgb, cv::COLOR_GRAY2RGB);
+        else if (frame.channels() == 4)
+            cv::cvtColor(frame, rgb, cv::COLOR_BGRA2RGB);
+        else
+            cv::cvtColor(frame, rgb, cv::COLOR_BGR2RGB);
+    } catch (const cv::Exception&) {
+        return;
+    }
+    if (rgb.empty() || rgb.cols < 1 || rgb.rows < 1) return;
 
-    float frameAspect = (float)rgb.cols / (float)rgb.rows;
-    float windowAspect = (float)windowWidth / (float)windowHeight;
+    float frameAspect = static_cast<float>(rgb.cols) / static_cast<float>(rgb.rows);
+    float windowAspect = static_cast<float>(windowWidth) / static_cast<float>(windowHeight);
 
     // Fit-contain size, then apply user scale
     float fitW, fitH;
     if (frameAspect > windowAspect) {
-        fitW = (float)windowWidth;
+        fitW = static_cast<float>(windowWidth);
         fitH = fitW / frameAspect;
     } else {
-        fitH = (float)windowHeight;
+        fitH = static_cast<float>(windowHeight);
         fitW = fitH * frameAspect;
     }
 
-    int drawWidth = std::max(1, static_cast<int>(fitW * videoScale));
-    int drawHeight = std::max(1, static_cast<int>(fitH * videoScale));
+    int drawWidth = std::max(1, static_cast<int>(fitW * videoScale + 0.5f));
+    int drawHeight = std::max(1, static_cast<int>(fitH * videoScale + 0.5f));
+    // Cap allocation size to avoid huge temporaries while still allowing zoom via ROI clip
+    const int maxDim = std::max(windowWidth, windowHeight) * 4;
+    drawWidth = std::min(drawWidth, std::max(1, maxDim));
+    drawHeight = std::min(drawHeight, std::max(1, maxDim));
+
     int offsetX = (windowWidth - drawWidth) / 2 + static_cast<int>(videoOffsetX * windowWidth * 0.5f);
     int offsetY = (windowHeight - drawHeight) / 2 + static_cast<int>(videoOffsetY * windowHeight * 0.5f);
 
     cv::Mat resized;
-    cv::resize(rgb, resized, cv::Size(drawWidth, drawHeight), 0, 0, cv::INTER_LINEAR);
+    try {
+        cv::resize(rgb, resized, cv::Size(drawWidth, drawHeight), 0, 0, cv::INTER_LINEAR);
+    } catch (const cv::Exception&) {
+        return;
+    }
+    if (resized.empty()) return;
     if (!resized.isContinuous())
         resized = resized.clone();
+
+    // Clip to the window so glDrawPixels never writes outside the framebuffer
+    int srcX = 0, srcY = 0;
+    int dstX = offsetX, dstY = offsetY;
+    int dstW = drawWidth, dstH = drawHeight;
+    if (dstX < 0) { srcX = -dstX; dstW += dstX; dstX = 0; }
+    if (dstY < 0) { srcY = -dstY; dstH += dstY; dstY = 0; }
+    if (dstX + dstW > windowWidth) dstW = windowWidth - dstX;
+    if (dstY + dstH > windowHeight) dstH = windowHeight - dstY;
+    if (dstW <= 0 || dstH <= 0) return;
+    if (srcX + dstW > resized.cols) dstW = resized.cols - srcX;
+    if (srcY + dstH > resized.rows) dstH = resized.rows - srcY;
+    if (dstW <= 0 || dstH <= 0) return;
+
+    cv::Mat roi = resized(cv::Rect(srcX, srcY, dstW, dstH));
+    if (!roi.isContinuous())
+        roi = roi.clone();
 
     glViewport(0, 0, windowWidth, windowHeight);
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
-    gluOrtho2D(0, windowWidth, 0, windowHeight);
+    gluOrtho2D(0.0, static_cast<double>(windowWidth), 0.0, static_cast<double>(windowHeight));
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
 
-    glRasterPos2i(offsetX, offsetY);
-    // Avoid invalid raster positions when heavily offset
-    GLboolean valid = GL_TRUE;
+    glRasterPos2i(dstX, dstY);
+    GLboolean valid = GL_FALSE;
     glGetBooleanv(GL_CURRENT_RASTER_POSITION_VALID, &valid);
     if (valid) {
-        glDrawPixels(resized.cols, resized.rows, GL_RGB, GL_UNSIGNED_BYTE, resized.data);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glDrawPixels(dstW, dstH, GL_RGB, GL_UNSIGNED_BYTE, roi.data);
     }
 
     // Reset for UI
@@ -1511,6 +1965,8 @@ void display() {
         drawButton(-0.55f, -0.85f, 0.15f * uiScale, 0.08f * uiScale, ">>");
         drawButton(-0.35f, -0.85f, 0.15f * uiScale, 0.08f * uiScale, isLooping ? "Loop" : "NoLoop");
         drawButton(-0.15f, -0.85f, 0.15f * uiScale, 0.08f * uiScale, "Next");
+        drawButton(0.05f, -0.85f, 0.15f * uiScale, 0.08f * uiScale, "Open");
+        drawButton(0.25f, -0.85f, 0.15f * uiScale, 0.08f * uiScale, "Cam");
         drawButton(0.8f, -0.85f, 0.15f * uiScale, 0.08f * uiScale, fullscreen ? "FullScreen" : "Windowed");
 
         // Filter controls (toggles only — sliders live in the left Active Effects panel)
@@ -1527,18 +1983,20 @@ void display() {
 
         // Help text
         drawText(-0.95f, 0.95f, "Space: Play/Pause | L: Loop | N: Next | F: Fullscreen | U: Toggle UI | 1-9: Filters");
-        drawText(-0.95f, 0.9f, "Right-click: Pie menu | WASD: Move video | O/P: Scale | R: Reset view | [/]: Speed");
+        drawText(-0.95f, 0.9f, "V: Open video | C: Cameras | Right-click: Pie | WASD/O/P/R: View | [/]: Speed");
     }
 
     drawPieMenu();
+    drawSourceMenu();
 
     glutSwapBuffers();
 }
 
 void reshape(int w, int h) {
-    windowWidth = w;
-    windowHeight = h;
-    glViewport(0, 0, w, h);
+    // GLUT can report 0 during interactive resize; never allow zero-sized GL state.
+    windowWidth = std::max(1, w);
+    windowHeight = std::max(1, h);
+    glViewport(0, 0, windowWidth, windowHeight);
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
     gluOrtho2D(-1.0, 1.0, -1.0, 1.0);
@@ -1546,7 +2004,7 @@ void reshape(int w, int h) {
     glLoadIdentity();
     
     // Adjust UI scale based on window size
-    uiScale = std::min(1.0f, std::max(0.7f, std::min(w / 800.0f, h / 600.0f)));
+    uiScale = std::min(1.0f, std::max(0.7f, std::min(windowWidth / 800.0f, windowHeight / 600.0f)));
 }
 
 void idle() {
