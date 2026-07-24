@@ -97,9 +97,11 @@ Toggle the same guides from the control panel **Calibration Guides** section.
 --fullscreen
 ```
 
-Filter enable flags: `anaglyph`, `anaglyphseq`, `motionpop`, `gray`, `edge`, `sepia`, `pixelate`, `invert`, `blur`, `vignette`, `noise`, `colorbalance`, `scanlines`, `crt`, `glitch`, `kaleidoscope`, `nightvision`, `colorize`.
+Filter enable flags: `anaglyph`, `anaglyphseq`, `motionpop`, `wavepop`, `gray`, `edge`, `sepia`, `pixelate`, `invert`, `blur`, `vignette`, `noise`, `colorbalance`, `scanlines`, `crt`, `glitch`, `kaleidoscope`, `nightvision`, `colorize`.
 
 **Motion Pop 3D** (`--enable-motionpop`): tracks large moving regions over time and only pops objects that stay on screen long enough (~0.5–1.5s) and cover a meaningful part of the frame. Brief flicker / small motion is ignored. Sliders: Strictness (higher = fewer / harder-to-qualify pops), Pop Scale.
+
+**Wave Pop 3D** (`--enable-wavepop`): same persistent tracking as Motion Pop, but tracked regions extrude with a soft raised-cosine **wave** (elliptical mound) instead of a hard box. Default view keeps the video fully in-frame; raise **Orbit Pitch** / shift **Orbit Yaw** to inspect the 3D extrusion. Sliders: Strength, Strictness, Wave Soft, Wave Radius, Orbit Yaw, Orbit Pitch, Pop Scale.
 
 ### Controls
 

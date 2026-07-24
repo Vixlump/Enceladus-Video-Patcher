@@ -49,6 +49,8 @@ int controlSavedX = 920, controlSavedY = 80, controlSavedW = 960, controlSavedH 
 int windowWidth = 960, windowHeight = 720;
 float uiScale = 1.0f;
 int activeSlider = -1; // -1 means no slider is active
+// Encodes activeSlider as filterIdx * AE_SLIDER_STRIDE + paramType (0=strength .. 6=param6)
+const int AE_SLIDER_STRIDE = 7;
 bool isSeeking = false;
 double videoDuration = 0;
 double currentVideoTime = 0;
@@ -149,13 +151,25 @@ public:
     virtual bool hasStrength() const { return true; }
     virtual bool hasParam1() const { return false; }
     virtual bool hasParam2() const { return false; }
+    virtual bool hasParam3() const { return false; }
+    virtual bool hasParam4() const { return false; }
+    virtual bool hasParam5() const { return false; }
+    virtual bool hasParam6() const { return false; }
     virtual std::string param1Name() const { return ""; }
     virtual std::string param2Name() const { return ""; }
+    virtual std::string param3Name() const { return ""; }
+    virtual std::string param4Name() const { return ""; }
+    virtual std::string param5Name() const { return ""; }
+    virtual std::string param6Name() const { return ""; }
     
     bool enabled = false;
     float strength = 1.0f;
     float param1 = 0.5f;
     float param2 = 0.5f;
+    float param3 = 0.5f;
+    float param4 = 0.5f;
+    float param5 = 0.0f;
+    float param6 = 0.5f;
     virtual ~VideoFilter() = default;
 };
 
@@ -463,6 +477,378 @@ public:
     bool hasParam2() const override { return true; }
     std::string param1Name() const override { return "Strictness"; }
     std::string param2Name() const override { return "Pop Scale"; }
+};
+
+// Soft wave extrusion of tracked regions on an otherwise flat, in-frame video plane.
+// Default camera is frontal (video fills the frame); orbit sliders tip the view to
+// inspect the 3D mound. Unlike Motion Pop's hard box, height uses a raised-cosine
+// wave over each track's ellipse.
+class WavePop3DFilter : public VideoFilter {
+    struct Track {
+        cv::Rect box;
+        cv::Point2f center;
+        double area = 0.0;
+        float halfW = 40.0f;
+        float halfH = 40.0f;
+        int age = 0;
+        int missed = 0;
+    };
+
+    cv::Ptr<cv::BackgroundSubtractor> subtractor;
+    std::vector<Track> tracks;
+    static constexpr int kGrid = 80;
+
+    struct Vert {
+        float x, y, z, u, v;
+        float sx, sy, iw;
+    };
+
+    static float rectIoU(const cv::Rect& a, const cv::Rect& b) {
+        int x1 = std::max(a.x, b.x), y1 = std::max(a.y, b.y);
+        int x2 = std::min(a.x + a.width, b.x + b.width);
+        int y2 = std::min(a.y + a.height, b.y + b.height);
+        int inter = std::max(0, x2 - x1) * std::max(0, y2 - y1);
+        int uni = a.area() + b.area() - inter;
+        return uni > 0 ? static_cast<float>(inter) / uni : 0.0f;
+    }
+
+    static cv::Vec3b sampleBilinear(const cv::Mat& img, float u, float v) {
+        float x = u * (img.cols - 1);
+        float y = v * (img.rows - 1);
+        int x0 = std::max(0, std::min(img.cols - 1, static_cast<int>(std::floor(x))));
+        int y0 = std::max(0, std::min(img.rows - 1, static_cast<int>(std::floor(y))));
+        int x1 = std::max(0, std::min(img.cols - 1, x0 + 1));
+        int y1 = std::max(0, std::min(img.rows - 1, y0 + 1));
+        float tx = x - x0, ty = y - y0;
+        cv::Vec3b c00 = img.at<cv::Vec3b>(y0, x0);
+        cv::Vec3b c10 = img.at<cv::Vec3b>(y0, x1);
+        cv::Vec3b c01 = img.at<cv::Vec3b>(y1, x0);
+        cv::Vec3b c11 = img.at<cv::Vec3b>(y1, x1);
+        cv::Vec3b out;
+        for (int i = 0; i < 3; ++i) {
+            float a = c00[i] * (1 - tx) + c10[i] * tx;
+            float b = c01[i] * (1 - tx) + c11[i] * tx;
+            out[i] = static_cast<uchar>(a * (1 - ty) + b * ty);
+        }
+        return out;
+    }
+
+    static void drawTriangle(cv::Mat& dst, cv::Mat& zbuf, const Vert& a, const Vert& b, const Vert& c,
+                             const cv::Mat& tex) {
+        int minX = std::max(0, static_cast<int>(std::floor(std::min({a.sx, b.sx, c.sx}))));
+        int maxX = std::min(dst.cols - 1, static_cast<int>(std::ceil(std::max({a.sx, b.sx, c.sx}))));
+        int minY = std::max(0, static_cast<int>(std::floor(std::min({a.sy, b.sy, c.sy}))));
+        int maxY = std::min(dst.rows - 1, static_cast<int>(std::ceil(std::max({a.sy, b.sy, c.sy}))));
+        float area = (b.sx - a.sx) * (c.sy - a.sy) - (c.sx - a.sx) * (b.sy - a.sy);
+        if (std::fabs(area) < 1e-4f) return;
+        float invArea = 1.0f / area;
+
+        for (int y = minY; y <= maxY; ++y) {
+            for (int x = minX; x <= maxX; ++x) {
+                float w0 = ((b.sx - x) * (c.sy - y) - (c.sx - x) * (b.sy - y)) * invArea;
+                float w1 = ((c.sx - x) * (a.sy - y) - (a.sx - x) * (c.sy - y)) * invArea;
+                float w2 = 1.0f - w0 - w1;
+                if (w0 < 0.0f || w1 < 0.0f || w2 < 0.0f) continue;
+
+                float iw = w0 * a.iw + w1 * b.iw + w2 * c.iw;
+                float* zpx = zbuf.ptr<float>(y) + x;
+                if (iw <= *zpx) continue;
+                *zpx = iw;
+
+                float u = (w0 * a.u * a.iw + w1 * b.u * b.iw + w2 * c.u * c.iw) / iw;
+                float v = (w0 * a.v * a.iw + w1 * b.v * b.iw + w2 * c.v * c.iw) / iw;
+                u = std::max(0.0f, std::min(1.0f, u));
+                v = std::max(0.0f, std::min(1.0f, v));
+                dst.at<cv::Vec3b>(y, x) = sampleBilinear(tex, u, v);
+            }
+        }
+    }
+
+    void updateTracks(const cv::Mat& frame) {
+        if (!subtractor)
+            subtractor = cv::createBackgroundSubtractorMOG2(300, 20.0, true);
+
+        // param1 = Strictness (same idea as Motion Pop)
+        cv::Mat motion;
+        double learn = 0.03 + param1 * 0.06;
+        subtractor->apply(frame, motion, learn);
+        int thresh = static_cast<int>(80 + param1 * 100.0f);
+        cv::threshold(motion, motion, thresh, 255, cv::THRESH_BINARY);
+        cv::morphologyEx(motion, motion, cv::MORPH_OPEN,
+                         cv::getStructuringElement(cv::MORPH_ELLIPSE, {5, 5}));
+        cv::morphologyEx(motion, motion, cv::MORPH_CLOSE,
+                         cv::getStructuringElement(cv::MORPH_ELLIPSE, {11, 11}));
+
+        const double frameArea = static_cast<double>(frame.rows) * frame.cols;
+        // Slightly looser than Motion Pop so extrusions show up more readily
+        const double minArea = frameArea * (0.006 + param1 * 0.022);
+        const int minW = std::max(16, frame.cols / 22);
+        const int minH = std::max(16, frame.rows / 22);
+        const int maxMissed = 14;
+
+        std::vector<std::vector<cv::Point>> contours;
+        cv::findContours(motion, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+        struct Detection { cv::Rect box; cv::Point2f center; double area; float halfW; float halfH; };
+        std::vector<Detection> detections;
+        for (const auto& c : contours) {
+            double area = cv::contourArea(c);
+            if (area < minArea) continue;
+            cv::Rect box = cv::boundingRect(c);
+            if (box.width < minW || box.height < minH) continue;
+            float aspect = box.width / static_cast<float>(std::max(1, box.height));
+            if (aspect > 8.0f || aspect < 1.0f / 8.0f) continue;
+            detections.push_back({
+                box,
+                {box.x + box.width * 0.5f, box.y + box.height * 0.5f},
+                area,
+                box.width * 0.5f,
+                box.height * 0.5f
+            });
+        }
+
+        std::vector<char> used(detections.size(), 0);
+        for (auto& tr : tracks) {
+            int best = -1;
+            float bestScore = 0.0f;
+            for (size_t i = 0; i < detections.size(); ++i) {
+                if (used[i]) continue;
+                float iou = rectIoU(tr.box, detections[i].box);
+                float dist = cv::norm(tr.center - detections[i].center);
+                float maxDist = 0.12f * std::max(frame.cols, frame.rows);
+                if (iou < 0.12f && dist > maxDist) continue;
+                float score = iou * 2.0f + (1.0f - std::min(1.0f, dist / maxDist));
+                if (score > bestScore) { bestScore = score; best = static_cast<int>(i); }
+            }
+            if (best >= 0) {
+                tr.box = detections[best].box;
+                tr.center = detections[best].center;
+                tr.area = detections[best].area;
+                tr.halfW = detections[best].halfW;
+                tr.halfH = detections[best].halfH;
+                tr.age += 1;
+                tr.missed = 0;
+                used[best] = 1;
+            } else {
+                tr.missed += 1;
+            }
+        }
+        tracks.erase(std::remove_if(tracks.begin(), tracks.end(),
+                                    [&](const Track& t) { return t.missed > maxMissed; }),
+                     tracks.end());
+        for (size_t i = 0; i < detections.size(); ++i) {
+            if (used[i]) continue;
+            tracks.push_back({detections[i].box, detections[i].center, detections[i].area,
+                              detections[i].halfW, detections[i].halfH, 1, 0});
+        }
+    }
+
+    // Raised-cosine mound over each track ellipse (0 outside, 1 at center).
+    // Age fades in so pops appear sooner and ramp smoothly.
+    float heightAt(float u, float v, int frameW, int frameH) const {
+        const int minAge = 6 + static_cast<int>(param1 * 18.0f); // ~6–24 frames
+        const float radiusMul = 0.7f + param3 * 1.5f;            // Wave Radius
+        const float softPow = 0.35f + param2 * 1.8f;             // Wave Soft
+        // Strength + Pop Scale drive extrusion height (visible in frontal + orbit)
+        const float amp = (0.15f + strength * 0.95f) * (0.45f + param6 * 1.35f);
+
+        float bump = 0.0f;
+        for (const auto& tr : tracks) {
+            if (tr.age < minAge / 2) continue;
+            float maturity = std::min(1.0f, tr.age / static_cast<float>(std::max(1, minAge)));
+            float cu = tr.center.x / std::max(1, frameW - 1);
+            float cv = tr.center.y / std::max(1, frameH - 1);
+            float rx = std::max(0.03f, (tr.halfW / std::max(1, frameW - 1)) * radiusMul);
+            float ry = std::max(0.03f, (tr.halfH / std::max(1, frameH - 1)) * radiusMul);
+            float nx = (u - cu) / rx;
+            float ny = (v - cv) / ry;
+            float r2 = nx * nx + ny * ny;
+            if (r2 >= 1.0f) continue;
+            float t = std::sqrt(r2);
+            float wave = 0.5f * (1.0f + std::cos(static_cast<float>(M_PI) * t));
+            wave = std::pow(std::max(0.0f, wave), softPow);
+            bump = std::max(bump, wave * maturity);
+        }
+        return bump * amp;
+    }
+
+    cv::Mat buildHeightMap(int rows, int cols) const {
+        const int gw = 96, gh = std::max(1, static_cast<int>(96.0f * rows / std::max(1, cols)));
+        cv::Mat small(gh, gw, CV_32FC1);
+        for (int y = 0; y < gh; ++y) {
+            float v = y / static_cast<float>(std::max(1, gh - 1));
+            float* row = small.ptr<float>(y);
+            for (int x = 0; x < gw; ++x) {
+                float u = x / static_cast<float>(std::max(1, gw - 1));
+                row[x] = heightAt(u, v, cols, rows);
+            }
+        }
+        cv::Mat full;
+        cv::resize(small, full, cv::Size(cols, rows), 0, 0, cv::INTER_LINEAR);
+        return full;
+    }
+
+    cv::Mat applyAnaglyph(const cv::Mat& scene, const cv::Mat& heightMap) const {
+        float maxH = 1e-4f;
+        for (int y = 0; y < heightMap.rows; ++y) {
+            const float* row = heightMap.ptr<float>(y);
+            for (int x = 0; x < heightMap.cols; ++x)
+                maxH = std::max(maxH, row[x]);
+        }
+        float maxDisp = 3.0f + strength * 16.0f;
+        cv::Mat mapLx(scene.rows, scene.cols, CV_32FC1);
+        cv::Mat mapLy(scene.rows, scene.cols, CV_32FC1);
+        cv::Mat mapRx(scene.rows, scene.cols, CV_32FC1);
+        cv::Mat mapRy(scene.rows, scene.cols, CV_32FC1);
+        for (int y = 0; y < scene.rows; ++y) {
+            const float* hrow = heightMap.ptr<float>(y);
+            float* lx = mapLx.ptr<float>(y);
+            float* ly = mapLy.ptr<float>(y);
+            float* rx = mapRx.ptr<float>(y);
+            float* ry = mapRy.ptr<float>(y);
+            for (int x = 0; x < scene.cols; ++x) {
+                float d = (hrow[x] / maxH) * maxDisp;
+                lx[x] = x + 0.5f * d;
+                rx[x] = x - 0.5f * d;
+                ly[x] = static_cast<float>(y);
+                ry[x] = static_cast<float>(y);
+            }
+        }
+        cv::Mat leftView, rightView;
+        cv::remap(scene, leftView, mapLx, mapLy, cv::INTER_LINEAR, cv::BORDER_REPLICATE);
+        cv::remap(scene, rightView, mapRx, mapRy, cv::INTER_LINEAR, cv::BORDER_REPLICATE);
+        std::vector<cv::Mat> lch, rch;
+        cv::split(leftView, lch);
+        cv::split(rightView, rch);
+        cv::Mat output;
+        std::vector<cv::Mat> outCh = {rch[0], rch[1], lch[2]};
+        cv::merge(outCh, output);
+        return output;
+    }
+
+public:
+    cv::Mat apply(const cv::Mat& frame) override {
+        if (!enabled || frame.empty()) return frame;
+
+        updateTracks(frame);
+
+        // Always render a textured mesh. Frontal (yaw=0.5, pitch=0) maps the flat
+        // plane 1:1 into the frame; extruded tracks pop toward the camera. Orbit
+        // rotates that same plane — no separate "background video" underlay.
+        const float yaw = (param4 - 0.5f) * static_cast<float>(M_PI); // ±90°
+        const float pitch = param5 * 1.15f;                            // 0 = flat
+        const bool orbiting = std::fabs(yaw) > 0.02f || pitch > 0.02f;
+        const float focal = 2.0f;
+        const float camDist = focal; // identity fill when flat / no height
+        const float cy = std::cos(yaw), sy = std::sin(yaw);
+        const float cp = std::cos(pitch), sp = std::sin(pitch);
+        const float aspect = static_cast<float>(frame.cols) / std::max(1, frame.rows);
+
+        const int maxW = 640;
+        float resScale = 1.0f;
+        int rw = frame.cols, rh = frame.rows;
+        if (rw > maxW) {
+            resScale = static_cast<float>(maxW) / rw;
+            rw = maxW;
+            rh = std::max(1, static_cast<int>(frame.rows * resScale));
+        }
+        cv::Mat tex;
+        if (resScale < 0.999f)
+            cv::resize(frame, tex, cv::Size(rw, rh), 0, 0, cv::INTER_AREA);
+        else
+            tex = frame;
+
+        std::vector<Vert> verts(static_cast<size_t>((kGrid + 1) * (kGrid + 1)));
+        for (int j = 0; j <= kGrid; ++j) {
+            for (int i = 0; i <= kGrid; ++i) {
+                float u = static_cast<float>(i) / kGrid;
+                float v = static_cast<float>(j) / kGrid;
+                Vert& vt = verts[static_cast<size_t>(j * (kGrid + 1) + i)];
+                vt.u = u;
+                vt.v = v;
+
+                float px = (u - 0.5f) * 2.0f * aspect;
+                float py = (0.5f - v) * 2.0f;
+                float pz = heightAt(u, v, frame.cols, frame.rows);
+
+                // Yaw around Y, then pitch around X
+                float x1 = px * cy + pz * sy;
+                float z1 = -px * sy + pz * cy;
+                float y2 = py * cp - z1 * sp;
+                float z2 = py * sp + z1 * cp;
+
+                float viewZ = camDist - z2;
+                vt.iw = 1.0f / std::max(0.12f, viewZ);
+                float persp = focal * vt.iw;
+                vt.sx = (0.5f + 0.5f * (x1 * persp) / aspect) * (rw - 1);
+                vt.sy = (0.5f - 0.5f * (y2 * persp)) * (rh - 1);
+            }
+        }
+
+        // When orbiting, fit the projected plane into the frame so we don't clip oddly
+        if (orbiting) {
+            float minSX = 1e9f, maxSX = -1e9f, minSY = 1e9f, maxSY = -1e9f;
+            for (const auto& vt : verts) {
+                minSX = std::min(minSX, vt.sx); maxSX = std::max(maxSX, vt.sx);
+                minSY = std::min(minSY, vt.sy); maxSY = std::max(maxSY, vt.sy);
+            }
+            float spanX = std::max(1.0f, maxSX - minSX);
+            float spanY = std::max(1.0f, maxSY - minSY);
+            float fit = 0.92f * std::min((rw - 1) / spanX, (rh - 1) / spanY);
+            float midX = 0.5f * (minSX + maxSX);
+            float midY = 0.5f * (minSY + maxSY);
+            float cxScreen = 0.5f * (rw - 1);
+            float cyScreen = 0.5f * (rh - 1);
+            for (auto& vt : verts) {
+                vt.sx = (vt.sx - midX) * fit + cxScreen;
+                vt.sy = (vt.sy - midY) * fit + cyScreen;
+            }
+        }
+
+        // Dark clear — mesh only (fixes "video in background + rotated copy")
+        cv::Mat small(rh, rw, CV_8UC3, cv::Scalar(8, 8, 10));
+        cv::Mat zbuf(rh, rw, CV_32FC1, cv::Scalar(0));
+
+        auto idx = [&](int i, int j) { return static_cast<size_t>(j * (kGrid + 1) + i); };
+        for (int j = 0; j < kGrid; ++j) {
+            for (int i = 0; i < kGrid; ++i) {
+                const Vert& v00 = verts[idx(i, j)];
+                const Vert& v10 = verts[idx(i + 1, j)];
+                const Vert& v01 = verts[idx(i, j + 1)];
+                const Vert& v11 = verts[idx(i + 1, j + 1)];
+                drawTriangle(small, zbuf, v00, v10, v11, tex);
+                drawTriangle(small, zbuf, v00, v11, v01, tex);
+            }
+        }
+
+        cv::Mat output;
+        if (resScale < 0.999f)
+            cv::resize(small, output, frame.size(), 0, 0, cv::INTER_LINEAR);
+        else
+            output = small;
+
+        // Soft anaglyph from the same wave height (skip if nothing extruded yet)
+        cv::Mat heightMap = buildHeightMap(frame.rows, frame.cols);
+        double minV = 0, maxV = 0;
+        cv::minMaxLoc(heightMap, &minV, &maxV);
+        if (maxV > 0.02 && strength > 0.05f)
+            output = applyAnaglyph(output, heightMap);
+
+        return output;
+    }
+
+    std::string name() const override { return "Wave Pop 3D"; }
+    bool hasParam1() const override { return true; }
+    bool hasParam2() const override { return true; }
+    bool hasParam3() const override { return true; }
+    bool hasParam4() const override { return true; }
+    bool hasParam5() const override { return true; }
+    bool hasParam6() const override { return true; }
+    std::string param1Name() const override { return "Strictness"; }
+    std::string param2Name() const override { return "Wave Soft"; }
+    std::string param3Name() const override { return "Wave Radius"; }
+    std::string param4Name() const override { return "Orbit Yaw"; }
+    std::string param5Name() const override { return "Orbit Pitch"; }
+    std::string param6Name() const override { return "Pop Scale"; }
 };
 
 class GrayscaleFilter : public VideoFilter {
@@ -1476,7 +1862,7 @@ bool hitTestFilterListPanel(float fx, float fy) {
         if (isInside(fx, fy, FILT_PANEL_X + 0.02f, y - FILT_BTN_H, FILT_PANEL_W - 0.04f, FILT_BTN_H)) {
             filters[idx]->enabled = !filters[idx]->enabled;
             if (filters[idx]->enabled)
-                activeSlider = idx * 3;
+                activeSlider = idx * AE_SLIDER_STRIDE;
             return true;
         }
         y -= FILT_ROW_H;
@@ -1495,7 +1881,7 @@ const float AE_TITLE_STEP = 0.06f;
 const float AE_NAME_STEP = 0.05f;
 const float AE_SLIDER_STEP = 0.07f;
 const float AE_FILTER_GAP = 0.035f;
-const float AE_BOTTOM_LIMIT = -0.58f;
+const float AE_BOTTOM_LIMIT = -0.78f;
 
 bool anyFilterEnabled() {
     for (const auto& filter : filters) {
@@ -1512,6 +1898,10 @@ float activeEffectsContentHeight() {
         if (filter->hasStrength()) h += AE_SLIDER_STEP;
         if (filter->hasParam1()) h += AE_SLIDER_STEP;
         if (filter->hasParam2()) h += AE_SLIDER_STEP;
+        if (filter->hasParam3()) h += AE_SLIDER_STEP;
+        if (filter->hasParam4()) h += AE_SLIDER_STEP;
+        if (filter->hasParam5()) h += AE_SLIDER_STEP;
+        if (filter->hasParam6()) h += AE_SLIDER_STEP;
         h += AE_FILTER_GAP;
     }
     return h;
@@ -1570,6 +1960,26 @@ void drawActiveEffectsPanel() {
                        filters[i]->param2, filters[i]->param2Name());
             currentY -= AE_SLIDER_STEP;
         }
+        if (filters[i]->hasParam3()) {
+            drawSlider(AE_CONTENT_X, currentY - AE_SLIDER_H, AE_SLIDER_W, AE_SLIDER_H,
+                       filters[i]->param3, filters[i]->param3Name());
+            currentY -= AE_SLIDER_STEP;
+        }
+        if (filters[i]->hasParam4()) {
+            drawSlider(AE_CONTENT_X, currentY - AE_SLIDER_H, AE_SLIDER_W, AE_SLIDER_H,
+                       filters[i]->param4, filters[i]->param4Name());
+            currentY -= AE_SLIDER_STEP;
+        }
+        if (filters[i]->hasParam5()) {
+            drawSlider(AE_CONTENT_X, currentY - AE_SLIDER_H, AE_SLIDER_W, AE_SLIDER_H,
+                       filters[i]->param5, filters[i]->param5Name());
+            currentY -= AE_SLIDER_STEP;
+        }
+        if (filters[i]->hasParam6()) {
+            drawSlider(AE_CONTENT_X, currentY - AE_SLIDER_H, AE_SLIDER_W, AE_SLIDER_H,
+                       filters[i]->param6, filters[i]->param6Name());
+            currentY -= AE_SLIDER_STEP;
+        }
         currentY -= AE_FILTER_GAP;
     }
 }
@@ -1594,7 +2004,7 @@ bool hitTestActiveEffectsSliders(float fx, float fy) {
         auto trySlider = [&](int paramType, float& value) -> bool {
             float sy = currentY - AE_SLIDER_H;
             if (isInside(fx, fy, AE_CONTENT_X, sy, AE_SLIDER_W, AE_SLIDER_H)) {
-                activeSlider = static_cast<int>(i) * 3 + paramType;
+                activeSlider = static_cast<int>(i) * AE_SLIDER_STRIDE + paramType;
                 value = std::max(0.0f, std::min(1.0f, (fx - AE_CONTENT_X) / AE_SLIDER_W));
                 return true;
             }
@@ -1605,6 +2015,10 @@ bool hitTestActiveEffectsSliders(float fx, float fy) {
         if (filters[i]->hasStrength() && trySlider(0, filters[i]->strength)) return true;
         if (filters[i]->hasParam1() && trySlider(1, filters[i]->param1)) return true;
         if (filters[i]->hasParam2() && trySlider(2, filters[i]->param2)) return true;
+        if (filters[i]->hasParam3() && trySlider(3, filters[i]->param3)) return true;
+        if (filters[i]->hasParam4() && trySlider(4, filters[i]->param4)) return true;
+        if (filters[i]->hasParam5() && trySlider(5, filters[i]->param5)) return true;
+        if (filters[i]->hasParam6() && trySlider(6, filters[i]->param6)) return true;
 
         currentY -= AE_FILTER_GAP;
     }
@@ -2005,7 +2419,7 @@ void mouse(int button, int state, int x, int y) {
                     int selected = static_cast<int>((angle / (2.0f * M_PI)) * filters.size());
                     if (selected >= 0 && selected < static_cast<int>(filters.size())) {
                         filters[selected]->enabled = !filters[selected]->enabled;
-                        activeSlider = selected * 3;
+                        activeSlider = selected * AE_SLIDER_STRIDE;
                     }
                 } else {
                     showPieMenu = false;
@@ -2108,8 +2522,8 @@ void mouseMotion(int x, int y) {
 
     if (activeSlider == -1) return;
 
-    int filterIdx = activeSlider / 3;
-    int paramType = activeSlider % 3;
+    int filterIdx = activeSlider / AE_SLIDER_STRIDE;
+    int paramType = activeSlider % AE_SLIDER_STRIDE;
     if (filterIdx < 0 || filterIdx >= static_cast<int>(filters.size())) return;
 
     float normalizedValue = std::max(0.0f, std::min(1.0f, (fx - AE_CONTENT_X) / AE_SLIDER_W));
@@ -2117,6 +2531,10 @@ void mouseMotion(int x, int y) {
         case 0: filters[filterIdx]->strength = normalizedValue; break;
         case 1: filters[filterIdx]->param1 = normalizedValue; break;
         case 2: filters[filterIdx]->param2 = normalizedValue; break;
+        case 3: filters[filterIdx]->param3 = normalizedValue; break;
+        case 4: filters[filterIdx]->param4 = normalizedValue; break;
+        case 5: filters[filterIdx]->param5 = normalizedValue; break;
+        case 6: filters[filterIdx]->param6 = normalizedValue; break;
     }
 
     glutPostRedisplay();
@@ -2232,13 +2650,17 @@ void keyboard(unsigned char key, int x, int y) {
             break;
         case '-':
             if (activeSlider >= 0) {
-                int filterIdx = activeSlider / 3;
-                int paramType = activeSlider % 3;
+                int filterIdx = activeSlider / AE_SLIDER_STRIDE;
+                int paramType = activeSlider % AE_SLIDER_STRIDE;
                 float step = 0.05f;
                 switch (paramType) {
                     case 0: filters[filterIdx]->strength = std::max(0.0f, filters[filterIdx]->strength - step); break;
                     case 1: filters[filterIdx]->param1 = std::max(0.0f, filters[filterIdx]->param1 - step); break;
                     case 2: filters[filterIdx]->param2 = std::max(0.0f, filters[filterIdx]->param2 - step); break;
+                    case 3: filters[filterIdx]->param3 = std::max(0.0f, filters[filterIdx]->param3 - step); break;
+                    case 4: filters[filterIdx]->param4 = std::max(0.0f, filters[filterIdx]->param4 - step); break;
+                    case 5: filters[filterIdx]->param5 = std::max(0.0f, filters[filterIdx]->param5 - step); break;
+                    case 6: filters[filterIdx]->param6 = std::max(0.0f, filters[filterIdx]->param6 - step); break;
                 }
             } else {
                 videoScale = std::max(VIDEO_SCALE_MIN, videoScale - 0.05f);
@@ -2247,13 +2669,17 @@ void keyboard(unsigned char key, int x, int y) {
         case '=':
         case '+':
             if (activeSlider >= 0) {
-                int filterIdx = activeSlider / 3;
-                int paramType = activeSlider % 3;
+                int filterIdx = activeSlider / AE_SLIDER_STRIDE;
+                int paramType = activeSlider % AE_SLIDER_STRIDE;
                 float step = 0.05f;
                 switch (paramType) {
                     case 0: filters[filterIdx]->strength = std::min(1.0f, filters[filterIdx]->strength + step); break;
                     case 1: filters[filterIdx]->param1 = std::min(1.0f, filters[filterIdx]->param1 + step); break;
                     case 2: filters[filterIdx]->param2 = std::min(1.0f, filters[filterIdx]->param2 + step); break;
+                    case 3: filters[filterIdx]->param3 = std::min(1.0f, filters[filterIdx]->param3 + step); break;
+                    case 4: filters[filterIdx]->param4 = std::min(1.0f, filters[filterIdx]->param4 + step); break;
+                    case 5: filters[filterIdx]->param5 = std::min(1.0f, filters[filterIdx]->param5 + step); break;
+                    case 6: filters[filterIdx]->param6 = std::min(1.0f, filters[filterIdx]->param6 + step); break;
                 }
             } else {
                 videoScale = std::min(VIDEO_SCALE_MAX, videoScale + 0.05f);
@@ -2270,7 +2696,7 @@ void keyboard(unsigned char key, int x, int y) {
         case '9':
             if ((key - '1') < filters.size()) {
                 filters[key - '1']->enabled = !filters[key - '1']->enabled;
-                activeSlider = (key - '1') * 3; // Activate strength slider
+                activeSlider = (key - '1') * AE_SLIDER_STRIDE; // Activate strength slider
             }
             break;
         case '[':
@@ -3112,6 +3538,18 @@ int main(int argc, char** argv) {
     motionPop->param1 = 0.55f;
     motionPop->param2 = 0.45f;
     filters.push_back(std::move(motionPop));
+
+    auto wavePop = std::make_unique<WavePop3DFilter>();
+    wavePop->enabled = enabled.count("wavepop") || enabled.count("wave-pop") ||
+                       enabled.count("wave3d");
+    wavePop->strength = 0.85f; // Extrude / anaglyph amount
+    wavePop->param1 = 0.35f;   // Strictness (lower = easier tracks)
+    wavePop->param2 = 0.45f;   // Wave Soft
+    wavePop->param3 = 0.65f;   // Wave Radius
+    wavePop->param4 = 0.5f;    // Orbit Yaw (front / in-frame)
+    wavePop->param5 = 0.0f;    // Orbit Pitch (flat)
+    wavePop->param6 = 0.7f;    // Pop Scale
+    filters.push_back(std::move(wavePop));
 
     auto gray = std::make_unique<GrayscaleFilter>();
     gray->enabled = enabled.count("gray");
