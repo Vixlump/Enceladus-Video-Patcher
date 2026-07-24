@@ -49,8 +49,9 @@ int controlSavedX = 920, controlSavedY = 80, controlSavedW = 960, controlSavedH 
 int windowWidth = 960, windowHeight = 720;
 float uiScale = 1.0f;
 int activeSlider = -1; // -1 means no slider is active
-// Encodes activeSlider as filterIdx * AE_SLIDER_STRIDE + paramType (0=strength .. 6=param6)
-const int AE_SLIDER_STRIDE = 7;
+// Encodes activeSlider as filterIdx * AE_SLIDER_STRIDE + paramType (0=strength .. 8=param8)
+const int AE_SLIDER_STRIDE = 9;
+float aePanelScroll = 0.0f; // scroll offset for tall Active Effects lists
 bool isSeeking = false;
 double videoDuration = 0;
 double currentVideoTime = 0;
@@ -155,12 +156,24 @@ public:
     virtual bool hasParam4() const { return false; }
     virtual bool hasParam5() const { return false; }
     virtual bool hasParam6() const { return false; }
+    virtual bool hasParam7() const { return false; }
+    virtual bool hasParam8() const { return false; }
     virtual std::string param1Name() const { return ""; }
     virtual std::string param2Name() const { return ""; }
     virtual std::string param3Name() const { return ""; }
     virtual std::string param4Name() const { return ""; }
     virtual std::string param5Name() const { return ""; }
     virtual std::string param6Name() const { return ""; }
+    virtual std::string param7Name() const { return ""; }
+    virtual std::string param8Name() const { return ""; }
+    virtual bool hasReset() const { return false; }
+    virtual void reset() {}
+    // Optional calibration / tool buttons drawn under a filter's sliders
+    virtual int toolButtonCount() const { return 0; }
+    virtual std::string toolButtonName(int /*i*/) const { return ""; }
+    virtual bool toolButtonActive(int /*i*/) const { return false; }
+    virtual void toolButtonClick(int /*i*/) {}
+    virtual std::string statusLine() const { return ""; }
     
     bool enabled = false;
     float strength = 1.0f;
@@ -170,6 +183,8 @@ public:
     float param4 = 0.5f;
     float param5 = 0.0f;
     float param6 = 0.5f;
+    float param7 = 0.5f;
+    float param8 = 0.5f;
     virtual ~VideoFilter() = default;
 };
 
@@ -496,6 +511,10 @@ class WavePop3DFilter : public VideoFilter {
 
     cv::Ptr<cv::BackgroundSubtractor> subtractor;
     std::vector<Track> tracks;
+    cv::Mat lastMotion; // for calibration overlay
+    bool showTracks = false;
+    bool showMotion = false;
+    bool showHeight = false;
     static constexpr int kGrid = 80;
 
     struct Vert {
@@ -578,6 +597,7 @@ class WavePop3DFilter : public VideoFilter {
                          cv::getStructuringElement(cv::MORPH_ELLIPSE, {5, 5}));
         cv::morphologyEx(motion, motion, cv::MORPH_CLOSE,
                          cv::getStructuringElement(cv::MORPH_ELLIPSE, {11, 11}));
+        lastMotion = motion;
 
         const double frameArea = static_cast<double>(frame.rows) * frame.cols;
         // Slightly looser than Motion Pop so extrusions show up more readily
@@ -645,10 +665,11 @@ class WavePop3DFilter : public VideoFilter {
     // Raised-cosine mound over each track ellipse (0 outside, 1 at center).
     // Age fades in so pops appear sooner and ramp smoothly.
     float heightAt(float u, float v, int frameW, int frameH) const {
-        const int minAge = 6 + static_cast<int>(param1 * 18.0f); // ~6–24 frames
+        // param7 = Hold Time (how long before full pop)
+        const int minAge = 4 + static_cast<int>((0.25f + param7 * 0.75f) * (8 + param1 * 20.0f));
         const float radiusMul = 0.7f + param3 * 1.5f;            // Wave Radius
         const float softPow = 0.35f + param2 * 1.8f;             // Wave Soft
-        // Strength + Pop Scale drive extrusion height (visible in frontal + orbit)
+        // Strength + Pop Scale drive extrusion height
         const float amp = (0.15f + strength * 0.95f) * (0.45f + param6 * 1.35f);
 
         float bump = 0.0f;
@@ -694,7 +715,7 @@ class WavePop3DFilter : public VideoFilter {
             for (int x = 0; x < heightMap.cols; ++x)
                 maxH = std::max(maxH, row[x]);
         }
-        float maxDisp = 3.0f + strength * 16.0f;
+        float maxDisp = 1.0f + param8 * (4.0f + strength * 18.0f);
         cv::Mat mapLx(scene.rows, scene.cols, CV_32FC1);
         cv::Mat mapLy(scene.rows, scene.cols, CV_32FC1);
         cv::Mat mapRx(scene.rows, scene.cols, CV_32FC1);
@@ -826,14 +847,71 @@ public:
         else
             output = small;
 
-        // Soft anaglyph from the same wave height (skip if nothing extruded yet)
+        // Soft anaglyph from the same wave height (param8 = anaglyph amount)
         cv::Mat heightMap = buildHeightMap(frame.rows, frame.cols);
         double minV = 0, maxV = 0;
         cv::minMaxLoc(heightMap, &minV, &maxV);
-        if (maxV > 0.02 && strength > 0.05f)
+        if (maxV > 0.02 && param8 > 0.05f)
             output = applyAnaglyph(output, heightMap);
 
+        // Calibration overlays (drawn in image space; helpful while tuning)
+        if (showMotion && !lastMotion.empty()) {
+            cv::Mat motionBgr;
+            cv::cvtColor(lastMotion, motionBgr, cv::COLOR_GRAY2BGR);
+            if (motionBgr.size() != output.size())
+                cv::resize(motionBgr, motionBgr, output.size(), 0, 0, cv::INTER_NEAREST);
+            cv::addWeighted(output, 0.55, motionBgr, 0.45, 0, output);
+        }
+        if (showHeight && maxV > 1e-4) {
+            cv::Mat norm, heat;
+            heightMap.convertTo(norm, CV_8UC1, 255.0 / maxV);
+            cv::applyColorMap(norm, heat, cv::COLORMAP_TURBO);
+            cv::addWeighted(output, 0.55, heat, 0.45, 0, output);
+        }
+        if (showTracks) {
+            const int minAge = 4 + static_cast<int>((0.25f + param7 * 0.75f) * (8 + param1 * 20.0f));
+            for (const auto& tr : tracks) {
+                cv::Scalar col = tr.age >= minAge ? cv::Scalar(40, 220, 80) : cv::Scalar(40, 160, 255);
+                float rx = tr.halfW * (0.7f + param3 * 1.5f);
+                float ry = tr.halfH * (0.7f + param3 * 1.5f);
+                cv::ellipse(output, tr.center, cv::Size(std::max(2, static_cast<int>(rx)),
+                                                         std::max(2, static_cast<int>(ry))),
+                            0, 0, 360, col, 2, cv::LINE_AA);
+                cv::circle(output, tr.center, 3, col, -1, cv::LINE_AA);
+                std::string label = "a" + std::to_string(tr.age);
+                cv::putText(output, label,
+                            {static_cast<int>(tr.center.x) + 6, static_cast<int>(tr.center.y) - 6},
+                            cv::FONT_HERSHEY_SIMPLEX, 0.45, col, 1, cv::LINE_AA);
+            }
+        }
+
         return output;
+    }
+
+    void applyDefaultParams() {
+        strength = 0.85f;
+        param1 = 0.35f; // Strictness
+        param2 = 0.45f; // Wave Soft
+        param3 = 0.65f; // Wave Radius
+        param4 = 0.5f;  // Orbit Yaw
+        param5 = 0.0f;  // Orbit Pitch
+        param6 = 0.7f;  // Pop Scale
+        param7 = 0.4f;  // Hold Time
+        param8 = 0.55f; // Anaglyph
+    }
+
+    void resetTracking() {
+        tracks.clear();
+        lastMotion.release();
+        subtractor.release();
+    }
+
+    void reset() override {
+        applyDefaultParams();
+        resetTracking();
+        showTracks = false;
+        showMotion = false;
+        showHeight = false;
     }
 
     std::string name() const override { return "Wave Pop 3D"; }
@@ -843,12 +921,58 @@ public:
     bool hasParam4() const override { return true; }
     bool hasParam5() const override { return true; }
     bool hasParam6() const override { return true; }
+    bool hasParam7() const override { return true; }
+    bool hasParam8() const override { return true; }
     std::string param1Name() const override { return "Strictness"; }
     std::string param2Name() const override { return "Wave Soft"; }
     std::string param3Name() const override { return "Wave Radius"; }
     std::string param4Name() const override { return "Orbit Yaw"; }
     std::string param5Name() const override { return "Orbit Pitch"; }
     std::string param6Name() const override { return "Pop Scale"; }
+    std::string param7Name() const override { return "Hold Time"; }
+    std::string param8Name() const override { return "Anaglyph"; }
+    bool hasReset() const override { return true; }
+
+    int toolButtonCount() const override { return 6; }
+    std::string toolButtonName(int i) const override {
+        switch (i) {
+            case 0: return "Reset";
+            case 1: return "Front";
+            case 2: return "Tracks";
+            case 3: return "Motion";
+            case 4: return "Height";
+            case 5: return "Relearn";
+            default: return "";
+        }
+    }
+    bool toolButtonActive(int i) const override {
+        switch (i) {
+            case 2: return showTracks;
+            case 3: return showMotion;
+            case 4: return showHeight;
+            default: return false;
+        }
+    }
+    void toolButtonClick(int i) override {
+        switch (i) {
+            case 0: reset(); break;
+            case 1: param4 = 0.5f; param5 = 0.0f; break; // snap orbit frontal
+            case 2: showTracks = !showTracks; break;
+            case 3: showMotion = !showMotion; break;
+            case 4: showHeight = !showHeight; break;
+            case 5: resetTracking(); break; // relearn background only
+            default: break;
+        }
+    }
+    std::string statusLine() const override {
+        int mature = 0;
+        const int minAge = 4 + static_cast<int>((0.25f + param7 * 0.75f) * (8 + param1 * 20.0f));
+        for (const auto& tr : tracks)
+            if (tr.age >= minAge) ++mature;
+        return "tracks " + std::to_string(tracks.size()) +
+               "  mature " + std::to_string(mature) +
+               "  need " + std::to_string(minAge) + "f";
+    }
 };
 
 class GrayscaleFilter : public VideoFilter {
@@ -1881,7 +2005,11 @@ const float AE_TITLE_STEP = 0.06f;
 const float AE_NAME_STEP = 0.05f;
 const float AE_SLIDER_STEP = 0.07f;
 const float AE_FILTER_GAP = 0.035f;
-const float AE_BOTTOM_LIMIT = -0.78f;
+const float AE_BOTTOM_LIMIT = -0.88f;
+const float AE_TOOL_H = 0.045f;
+const float AE_TOOL_GAP = 0.01f;
+const float AE_TOOL_ROW = 0.055f;
+const float AE_STATUS_STEP = 0.04f;
 
 bool anyFilterEnabled() {
     for (const auto& filter : filters) {
@@ -1902,16 +2030,33 @@ float activeEffectsContentHeight() {
         if (filter->hasParam4()) h += AE_SLIDER_STEP;
         if (filter->hasParam5()) h += AE_SLIDER_STEP;
         if (filter->hasParam6()) h += AE_SLIDER_STEP;
+        if (filter->hasParam7()) h += AE_SLIDER_STEP;
+        if (filter->hasParam8()) h += AE_SLIDER_STEP;
+        int tools = filter->toolButtonCount();
+        if (tools > 0) {
+            int rows = (tools + 1) / 2;
+            h += rows * AE_TOOL_ROW + 0.01f;
+        }
+        if (!filter->statusLine().empty()) h += AE_STATUS_STEP;
         h += AE_FILTER_GAP;
     }
     return h;
 }
 
+void clampAePanelScroll() {
+    const float contentH = activeEffectsContentHeight();
+    const float viewH = AE_TOP_Y - AE_BOTTOM_LIMIT;
+    float maxScroll = std::max(0.0f, contentH - viewH);
+    aePanelScroll = std::max(0.0f, std::min(aePanelScroll, maxScroll));
+}
+
 void drawActiveEffectsPanel() {
     if (!anyFilterEnabled()) return;
 
+    clampAePanelScroll();
     const float contentH = activeEffectsContentHeight();
-    const float listY = std::max(AE_BOTTOM_LIMIT, AE_TOP_Y - contentH);
+    const float listY = AE_BOTTOM_LIMIT;
+    const float viewH = AE_TOP_Y - AE_BOTTOM_LIMIT;
 
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -1935,67 +2080,85 @@ void drawActiveEffectsPanel() {
 
     glColor3f(1.0f, 1.0f, 1.0f);
     drawText(AE_CONTENT_X, AE_TOP_Y - 0.04f, "Active Effects", GLUT_BITMAP_HELVETICA_18);
+    if (contentH > viewH + 0.01f) {
+        glColor3f(0.65f, 0.65f, 0.75f);
+        drawText(AE_CONTENT_X + 0.28f, AE_TOP_Y - 0.04f, "scroll", GLUT_BITMAP_HELVETICA_10);
+    }
 
-    float currentY = AE_TOP_Y - AE_TITLE_STEP;
+    float currentY = AE_TOP_Y - AE_TITLE_STEP + aePanelScroll;
     for (size_t i = 0; i < filters.size(); ++i) {
         if (!filters[i]->enabled) continue;
-        if (currentY < listY + 0.04f) break;
 
-        glColor3f(0.85f, 0.85f, 1.0f);
-        drawText(AE_CONTENT_X, currentY, filters[i]->name(), GLUT_BITMAP_HELVETICA_12);
+        auto inView = [&](float yBot, float yTop) {
+            return yTop >= listY + 0.02f && yBot <= AE_TOP_Y - 0.05f;
+        };
+
+        if (inView(currentY - 0.02f, currentY + 0.02f)) {
+            glColor3f(0.85f, 0.85f, 1.0f);
+            drawText(AE_CONTENT_X, currentY, filters[i]->name(), GLUT_BITMAP_HELVETICA_12);
+        }
         currentY -= AE_NAME_STEP;
 
-        if (filters[i]->hasStrength()) {
-            drawSlider(AE_CONTENT_X, currentY - AE_SLIDER_H, AE_SLIDER_W, AE_SLIDER_H,
-                       filters[i]->strength, "Strength");
+        auto drawParam = [&](float& value, const std::string& label) {
+            float sy = currentY - AE_SLIDER_H;
+            if (inView(sy, currentY + 0.02f))
+                drawSlider(AE_CONTENT_X, sy, AE_SLIDER_W, AE_SLIDER_H, value, label);
             currentY -= AE_SLIDER_STEP;
+        };
+
+        if (filters[i]->hasStrength()) drawParam(filters[i]->strength, "Strength");
+        if (filters[i]->hasParam1()) drawParam(filters[i]->param1, filters[i]->param1Name());
+        if (filters[i]->hasParam2()) drawParam(filters[i]->param2, filters[i]->param2Name());
+        if (filters[i]->hasParam3()) drawParam(filters[i]->param3, filters[i]->param3Name());
+        if (filters[i]->hasParam4()) drawParam(filters[i]->param4, filters[i]->param4Name());
+        if (filters[i]->hasParam5()) drawParam(filters[i]->param5, filters[i]->param5Name());
+        if (filters[i]->hasParam6()) drawParam(filters[i]->param6, filters[i]->param6Name());
+        if (filters[i]->hasParam7()) drawParam(filters[i]->param7, filters[i]->param7Name());
+        if (filters[i]->hasParam8()) drawParam(filters[i]->param8, filters[i]->param8Name());
+
+        int tools = filters[i]->toolButtonCount();
+        if (tools > 0) {
+            const float btnW = (AE_SLIDER_W - AE_TOOL_GAP) * 0.5f;
+            for (int t = 0; t < tools; ++t) {
+                int col = t % 2;
+                if (col == 0 && t > 0) { /* row already advanced below */ }
+                float bx = AE_CONTENT_X + col * (btnW + AE_TOOL_GAP);
+                float by = currentY - AE_TOOL_H;
+                if (inView(by, currentY)) {
+                    drawButton(bx, by, btnW, AE_TOOL_H,
+                               filters[i]->toolButtonName(t), false,
+                               filters[i]->toolButtonActive(t));
+                }
+                if (col == 1 || t == tools - 1)
+                    currentY -= AE_TOOL_ROW;
+            }
         }
-        if (filters[i]->hasParam1()) {
-            drawSlider(AE_CONTENT_X, currentY - AE_SLIDER_H, AE_SLIDER_W, AE_SLIDER_H,
-                       filters[i]->param1, filters[i]->param1Name());
-            currentY -= AE_SLIDER_STEP;
+
+        std::string status = filters[i]->statusLine();
+        if (!status.empty()) {
+            if (inView(currentY - 0.02f, currentY + 0.02f)) {
+                glColor3f(0.7f, 0.85f, 0.7f);
+                drawText(AE_CONTENT_X, currentY, status, GLUT_BITMAP_HELVETICA_10);
+            }
+            currentY -= AE_STATUS_STEP;
         }
-        if (filters[i]->hasParam2()) {
-            drawSlider(AE_CONTENT_X, currentY - AE_SLIDER_H, AE_SLIDER_W, AE_SLIDER_H,
-                       filters[i]->param2, filters[i]->param2Name());
-            currentY -= AE_SLIDER_STEP;
-        }
-        if (filters[i]->hasParam3()) {
-            drawSlider(AE_CONTENT_X, currentY - AE_SLIDER_H, AE_SLIDER_W, AE_SLIDER_H,
-                       filters[i]->param3, filters[i]->param3Name());
-            currentY -= AE_SLIDER_STEP;
-        }
-        if (filters[i]->hasParam4()) {
-            drawSlider(AE_CONTENT_X, currentY - AE_SLIDER_H, AE_SLIDER_W, AE_SLIDER_H,
-                       filters[i]->param4, filters[i]->param4Name());
-            currentY -= AE_SLIDER_STEP;
-        }
-        if (filters[i]->hasParam5()) {
-            drawSlider(AE_CONTENT_X, currentY - AE_SLIDER_H, AE_SLIDER_W, AE_SLIDER_H,
-                       filters[i]->param5, filters[i]->param5Name());
-            currentY -= AE_SLIDER_STEP;
-        }
-        if (filters[i]->hasParam6()) {
-            drawSlider(AE_CONTENT_X, currentY - AE_SLIDER_H, AE_SLIDER_W, AE_SLIDER_H,
-                       filters[i]->param6, filters[i]->param6Name());
-            currentY -= AE_SLIDER_STEP;
-        }
+
         currentY -= AE_FILTER_GAP;
     }
 }
 
-// Returns true if a slider was hit; sets activeSlider and updates the value.
+// Returns true if a slider or tool button was hit.
 bool hitTestActiveEffectsSliders(float fx, float fy) {
     if (!anyFilterEnabled()) return false;
 
-    const float contentH = activeEffectsContentHeight();
-    const float listY = std::max(AE_BOTTOM_LIMIT, AE_TOP_Y - contentH);
+    clampAePanelScroll();
+    const float listY = AE_BOTTOM_LIMIT;
     if (fx < AE_PANEL_X || fx > AE_PANEL_X + AE_PANEL_W ||
         fy < listY || fy > AE_TOP_Y) {
         return false;
     }
 
-    float currentY = AE_TOP_Y - AE_TITLE_STEP;
+    float currentY = AE_TOP_Y - AE_TITLE_STEP + aePanelScroll;
     for (size_t i = 0; i < filters.size(); ++i) {
         if (!filters[i]->enabled) continue;
 
@@ -2019,10 +2182,31 @@ bool hitTestActiveEffectsSliders(float fx, float fy) {
         if (filters[i]->hasParam4() && trySlider(4, filters[i]->param4)) return true;
         if (filters[i]->hasParam5() && trySlider(5, filters[i]->param5)) return true;
         if (filters[i]->hasParam6() && trySlider(6, filters[i]->param6)) return true;
+        if (filters[i]->hasParam7() && trySlider(7, filters[i]->param7)) return true;
+        if (filters[i]->hasParam8() && trySlider(8, filters[i]->param8)) return true;
+
+        int tools = filters[i]->toolButtonCount();
+        if (tools > 0) {
+            const float btnW = (AE_SLIDER_W - AE_TOOL_GAP) * 0.5f;
+            for (int t = 0; t < tools; ++t) {
+                int col = t % 2;
+                float bx = AE_CONTENT_X + col * (btnW + AE_TOOL_GAP);
+                float by = currentY - AE_TOOL_H;
+                if (isInside(fx, fy, bx, by, btnW, AE_TOOL_H)) {
+                    filters[i]->toolButtonClick(t);
+                    return true;
+                }
+                if (col == 1 || t == tools - 1)
+                    currentY -= AE_TOOL_ROW;
+            }
+        }
+
+        if (!filters[i]->statusLine().empty())
+            currentY -= AE_STATUS_STEP;
 
         currentY -= AE_FILTER_GAP;
     }
-    return false;
+    return true; // absorb clicks on AE chrome
 }
 
 void drawSlider(float x, float y, float w, float h, float value, const std::string& label) {
@@ -2310,7 +2494,7 @@ void mouse(int button, int state, int x, int y) {
         return;
     }
 
-    // Mouse wheel over filter list (FreeGLUT: button 3=up, 4=down)
+    // Mouse wheel over filter list / active effects (FreeGLUT: button 3=up, 4=down)
     if ((button == 3 || button == 4) && state == GLUT_DOWN) {
         if (fx >= FILT_PANEL_X && fx <= FILT_PANEL_X + FILT_PANEL_W &&
             fy >= FILT_PANEL_BOTTOM && fy <= FILT_PANEL_TOP) {
@@ -2321,6 +2505,17 @@ void mouse(int button, int state, int x, int y) {
                 filterListScroll = std::max(0, filterListScroll - 1);
             else
                 filterListScroll = std::min(maxScroll, filterListScroll + 1);
+            return;
+        }
+        if (anyFilterEnabled() &&
+            fx >= AE_PANEL_X && fx <= AE_PANEL_X + AE_PANEL_W &&
+            fy >= AE_BOTTOM_LIMIT && fy <= AE_TOP_Y) {
+            clampAePanelScroll();
+            if (button == 3)
+                aePanelScroll = std::max(0.0f, aePanelScroll - AE_SLIDER_STEP);
+            else
+                aePanelScroll += AE_SLIDER_STEP;
+            clampAePanelScroll();
             return;
         }
     }
@@ -2435,9 +2630,8 @@ void mouse(int button, int state, int x, int y) {
 
             // Don't open the pie menu over the Active Effects / View panels
             if (anyFilterEnabled()) {
-                const float listY = std::max(AE_BOTTOM_LIMIT, AE_TOP_Y - activeEffectsContentHeight());
                 if (fx >= AE_PANEL_X && fx <= AE_PANEL_X + AE_PANEL_W &&
-                    fy >= listY && fy <= AE_TOP_Y) {
+                    fy >= AE_BOTTOM_LIMIT && fy <= AE_TOP_Y) {
                     return;
                 }
             }
@@ -2535,6 +2729,8 @@ void mouseMotion(int x, int y) {
         case 4: filters[filterIdx]->param4 = normalizedValue; break;
         case 5: filters[filterIdx]->param5 = normalizedValue; break;
         case 6: filters[filterIdx]->param6 = normalizedValue; break;
+        case 7: filters[filterIdx]->param7 = normalizedValue; break;
+        case 8: filters[filterIdx]->param8 = normalizedValue; break;
     }
 
     glutPostRedisplay();
@@ -2661,6 +2857,8 @@ void keyboard(unsigned char key, int x, int y) {
                     case 4: filters[filterIdx]->param4 = std::max(0.0f, filters[filterIdx]->param4 - step); break;
                     case 5: filters[filterIdx]->param5 = std::max(0.0f, filters[filterIdx]->param5 - step); break;
                     case 6: filters[filterIdx]->param6 = std::max(0.0f, filters[filterIdx]->param6 - step); break;
+                    case 7: filters[filterIdx]->param7 = std::max(0.0f, filters[filterIdx]->param7 - step); break;
+                    case 8: filters[filterIdx]->param8 = std::max(0.0f, filters[filterIdx]->param8 - step); break;
                 }
             } else {
                 videoScale = std::max(VIDEO_SCALE_MIN, videoScale - 0.05f);
@@ -2680,6 +2878,8 @@ void keyboard(unsigned char key, int x, int y) {
                     case 4: filters[filterIdx]->param4 = std::min(1.0f, filters[filterIdx]->param4 + step); break;
                     case 5: filters[filterIdx]->param5 = std::min(1.0f, filters[filterIdx]->param5 + step); break;
                     case 6: filters[filterIdx]->param6 = std::min(1.0f, filters[filterIdx]->param6 + step); break;
+                    case 7: filters[filterIdx]->param7 = std::min(1.0f, filters[filterIdx]->param7 + step); break;
+                    case 8: filters[filterIdx]->param8 = std::min(1.0f, filters[filterIdx]->param8 + step); break;
                 }
             } else {
                 videoScale = std::min(VIDEO_SCALE_MAX, videoScale + 0.05f);
@@ -3542,13 +3742,7 @@ int main(int argc, char** argv) {
     auto wavePop = std::make_unique<WavePop3DFilter>();
     wavePop->enabled = enabled.count("wavepop") || enabled.count("wave-pop") ||
                        enabled.count("wave3d");
-    wavePop->strength = 0.85f; // Extrude / anaglyph amount
-    wavePop->param1 = 0.35f;   // Strictness (lower = easier tracks)
-    wavePop->param2 = 0.45f;   // Wave Soft
-    wavePop->param3 = 0.65f;   // Wave Radius
-    wavePop->param4 = 0.5f;    // Orbit Yaw (front / in-frame)
-    wavePop->param5 = 0.0f;    // Orbit Pitch (flat)
-    wavePop->param6 = 0.7f;    // Pop Scale
+    wavePop->applyDefaultParams();
     filters.push_back(std::move(wavePop));
 
     auto gray = std::make_unique<GrayscaleFilter>();
