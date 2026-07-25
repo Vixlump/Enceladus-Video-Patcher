@@ -120,8 +120,9 @@ Calibration tools: Reset, Front, Ana ON/OFF, Tracks / Motion / Height overlays, 
 | U | Toggle control UI chrome |
 | V | Open file browser |
 | C | Camera menu |
+| I | Live window / screen capture menu |
 | 1-9 | Toggle filters |
-| WASD / O P / R | Content pan/scale / reset view |
+| WASD / O P / R | Content pan/scale / reset view (R also refreshes open source menus) |
 | [/] | Playback speed |
 | ESC | Close menu / exit video fullscreen / quit |
 
@@ -136,8 +137,17 @@ Calibration tools: Reset, Front, Ana ON/OFF, Tracks / Motion / Height overlays, 
 
 #### Mouse
 
-- **Control panel:** transport, filters, sliders, Open/Cam, placement presets, guide toggles; right-click pie menu
+- **Control panel:** transport, filters, sliders, Open/Cam/Win, placement presets, guide toggles; right-click pie menu
 - **Video window:** drag interior to move; drag edges/corners to resize; right-click toggles crosshair
+
+### Live window capture (X11)
+
+**Win** button or **I** opens a list of top-level windows plus **Full Desktop / Screen**. Selecting one streams that region into the filter pipeline in real time (same filters as camera/file). Refresh rescans open windows. Requires an X11 session (`XDG_SESSION_TYPE=x11`).
+
+```bash
+./Enceladus_Video_Patcher --enable-enceladusvision
+# then press I / click Win and pick a window
+```
 
 ## Examples
 
