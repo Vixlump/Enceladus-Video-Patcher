@@ -47,9 +47,12 @@ sudo apt install ubuntu-restricted-extras
 
 ```bash
 ./Enceladus_Video_Patcher [video_file...] [options]
+./Enceladus_Video_Patcher --queue clip1.mp4 clip2.mp4 clip3.mkv
 ```
 
-With no files, camera `0` is used.
+With no files, camera `0` is used. Multiple video paths (positional or after `--queue` / `--playlist`) form a **playback queue**; **Next** / **N** advances. Relative paths are resolved from the current working directory first, then from the application executable folder.
+
+**Open** (or **V**) starts the file browser in the **executable's directory** (**App** button returns there; **~** goes to `$HOME`). Use **Queue** mode to add several videos without closing the browser, or **Play** mode to open immediately. **Que** / **Q** opens the queue panel (jump, Rem, Clear).
 
 ### Dual windows
 
@@ -118,7 +121,8 @@ Calibration tools: Reset, Front, Ana ON/OFF, Tracks / Motion / Height overlays, 
 | N | Next playlist item |
 | F | Toggle **video** fullscreen |
 | U | Toggle control UI chrome |
-| V | Open file browser |
+| V | Open file browser (starts in app folder) |
+| Q | Playback queue panel |
 | C | Camera menu |
 | I | Live window / screen capture menu |
 | 1-9 | Toggle filters |
@@ -137,7 +141,7 @@ Calibration tools: Reset, Front, Ana ON/OFF, Tracks / Motion / Height overlays, 
 
 #### Mouse
 
-- **Control panel:** transport, filters, sliders, Open/Cam/Win, placement presets, guide toggles; right-click pie menu
+- **Control panel:** transport, filters, sliders, Open/Que/Cam/Win, placement presets, guide toggles; right-click pie menu
 - **Video window:** drag interior to move; drag edges/corners to resize; right-click toggles crosshair
 
 ### Live window capture (X11)

@@ -184,12 +184,15 @@ float capFpsNorm = 0.55f;  // maps to ~8–60 fps
 int activeCapSlider = -1;
 double lastCapGrabTime = 0.0;
 
-// Source picker menus (file browser / webcam list / window capture)
-enum class SourceMenuMode { Closed, Files, Cameras, Windows };
+// Source picker menus (file browser / webcam list / window capture / queue)
+enum class SourceMenuMode { Closed, Files, Cameras, Windows, Queue };
 SourceMenuMode sourceMenuMode = SourceMenuMode::Closed;
+std::string appRootPath; // directory containing the running executable
 std::string browserPath;
 std::vector<std::pair<std::string, bool>> browserEntries; // name, isDirectory
 int browserScroll = 0;
+bool browserQueueMode = true; // true = add to queue (stay open); false = play now
+int queueScroll = 0;
 struct CameraDevice {
     int index;
     std::string label;
@@ -2105,17 +2108,51 @@ std::string truncateLabel(const std::string& s, size_t maxLen) {
     return s.substr(0, maxLen - 3) + "...";
 }
 
+std::string resolveAppRoot(const char* argv0) {
+    std::error_code ec;
+    fs::path exe = fs::read_symlink("/proc/self/exe", ec);
+    if (!ec && !exe.empty()) {
+        fs::path dir = fs::weakly_canonical(exe.parent_path(), ec);
+        if (!ec && !dir.empty()) return dir.string();
+        return exe.parent_path().string();
+    }
+    if (argv0 && argv0[0]) {
+        fs::path a(argv0);
+        if (a.has_parent_path()) {
+            fs::path dir = fs::weakly_canonical(fs::absolute(a).parent_path(), ec);
+            if (!ec && !dir.empty()) return dir.string();
+            return fs::absolute(a).parent_path().string();
+        }
+    }
+    fs::path cwd = fs::current_path(ec);
+    return ec ? std::string(".") : cwd.string();
+}
+
+std::string playlistItemLabel(const std::string& source) {
+    if (source.rfind("win:", 0) == 0 || source == "screen")
+        return source;
+    bool isCamera = !source.empty() &&
+        std::all_of(source.begin(), source.end(),
+                    [](unsigned char c) { return std::isdigit(c); });
+    if (isCamera) return "Camera " + source;
+    return fs::path(source).filename().string();
+}
+
+bool isCameraSourceId(const std::string& source) {
+    return !source.empty() &&
+        std::all_of(source.begin(), source.end(),
+                    [](unsigned char c) { return std::isdigit(c); });
+}
+
 void refreshBrowserEntries() {
     browserEntries.clear();
     std::error_code ec;
     if (browserPath.empty()) {
-        const char* home = std::getenv("HOME");
-        browserPath = home ? home : ".";
+        browserPath = !appRootPath.empty() ? appRootPath : ".";
     }
     fs::path path(browserPath);
     if (!fs::exists(path, ec) || !fs::is_directory(path, ec)) {
-        const char* home = std::getenv("HOME");
-        browserPath = home ? home : ".";
+        browserPath = !appRootPath.empty() ? appRootPath : ".";
         path = browserPath;
     }
     browserPath = fs::weakly_canonical(path, ec).string();
@@ -2188,21 +2225,7 @@ void scanCameras() {
         std::max(0, static_cast<int>(cameraDevices.size()) - SOURCE_MENU_ROWS)));
 }
 
-bool switchToSource(const std::string& source) {
-    cap.release();
-    auto it = std::find(playlist.begin(), playlist.end(), source);
-    if (it != playlist.end()) {
-        currentVideoIndex = static_cast<int>(it - playlist.begin());
-    } else {
-        playlist.push_back(source);
-        currentVideoIndex = static_cast<int>(playlist.size()) - 1;
-    }
-
-    if (!openVideoSource(source)) {
-        std::cerr << "Failed to open source: " << source << std::endl;
-        return false;
-    }
-
+bool applyOpenedSourceTiming() {
     if (windowCaptureActive) {
         videoDuration = 0.0;
     } else {
@@ -2221,16 +2244,99 @@ bool switchToSource(const std::string& source) {
     return true;
 }
 
+bool enqueueSource(const std::string& source, bool playNow) {
+    // Drop the idle default camera entry when building a real file queue.
+    if (!playlist.empty() && playlist.size() == 1 && playlist[0] == "0" &&
+        source != "0" && !isCameraSourceId(source) &&
+        source.rfind("win:", 0) != 0 && source != "screen") {
+        playlist.clear();
+        currentVideoIndex = 0;
+    }
+
+    auto it = std::find(playlist.begin(), playlist.end(), source);
+    int idx;
+    if (it != playlist.end()) {
+        idx = static_cast<int>(it - playlist.begin());
+    } else {
+        playlist.push_back(source);
+        idx = static_cast<int>(playlist.size()) - 1;
+    }
+
+    if (!playNow)
+        return true;
+
+    cap.release();
+    currentVideoIndex = idx;
+    if (!openVideoSource(source)) {
+        std::cerr << "Failed to open source: " << source << std::endl;
+        return false;
+    }
+    return applyOpenedSourceTiming();
+}
+
+bool switchToSource(const std::string& source) {
+    return enqueueSource(source, true);
+}
+
+bool jumpToPlaylistIndex(int idx) {
+    if (idx < 0 || idx >= static_cast<int>(playlist.size()))
+        return false;
+    cap.release();
+    currentVideoIndex = idx;
+    if (!openVideoSource(playlist[idx])) {
+        std::cerr << "Failed to open source: " << playlist[idx] << std::endl;
+        return false;
+    }
+    return applyOpenedSourceTiming();
+}
+
+void removePlaylistIndex(int idx) {
+    if (idx < 0 || idx >= static_cast<int>(playlist.size()))
+        return;
+    bool wasCurrent = (idx == currentVideoIndex);
+    playlist.erase(playlist.begin() + idx);
+    if (playlist.empty()) {
+        playlist.push_back("0");
+        currentVideoIndex = 0;
+        cap.release();
+        openVideoSource(playlist[0]);
+        applyOpenedSourceTiming();
+        return;
+    }
+    if (currentVideoIndex > idx)
+        --currentVideoIndex;
+    else if (wasCurrent) {
+        if (currentVideoIndex >= static_cast<int>(playlist.size()))
+            currentVideoIndex = static_cast<int>(playlist.size()) - 1;
+        jumpToPlaylistIndex(currentVideoIndex);
+    }
+}
+
+void clearPlaylistKeepCurrent() {
+    if (playlist.empty()) return;
+    std::string cur = playlist[std::max(0, std::min(currentVideoIndex,
+                          static_cast<int>(playlist.size()) - 1))];
+    playlist.clear();
+    playlist.push_back(cur);
+    currentVideoIndex = 0;
+}
+
 void openFileBrowserMenu() {
     showPieMenu = false;
     pieHoverIndex = -1;
     sourceMenuMode = SourceMenuMode::Files;
-    if (browserPath.empty()) {
-        const char* home = std::getenv("HOME");
-        browserPath = home ? home : ".";
-    }
+    if (browserPath.empty())
+        browserPath = !appRootPath.empty() ? appRootPath : ".";
     browserScroll = 0;
     refreshBrowserEntries();
+}
+
+void openQueueMenu() {
+    showPieMenu = false;
+    pieHoverIndex = -1;
+    sourceMenuMode = SourceMenuMode::Queue;
+    queueScroll = std::max(0, std::min(queueScroll,
+        std::max(0, static_cast<int>(playlist.size()) - SOURCE_MENU_ROWS)));
 }
 
 void openCameraMenu() {
@@ -2296,13 +2402,18 @@ void drawSourceMenu() {
 
     if (sourceMenuMode == SourceMenuMode::Files) {
         glColor3f(1.0f, 1.0f, 1.0f);
-        drawText(x + 0.03f, y + h - 0.05f, "Open Video File", GLUT_BITMAP_HELVETICA_18);
+        drawText(x + 0.03f, y + h - 0.05f, "Open / Queue Videos", GLUT_BITMAP_HELVETICA_18);
         drawText(x + 0.03f, y + h - 0.11f,
                  truncateLabel(browserPath, 70), GLUT_BITMAP_HELVETICA_12);
 
-        drawButton(x + 0.03f, y + 0.03f, 0.16f, 0.06f, "Up");
-        drawButton(x + 0.22f, y + 0.03f, 0.16f, 0.06f, "Home");
-        drawButton(x + 0.41f, y + 0.03f, 0.16f, 0.06f, "Refresh");
+        drawButton(x + 0.03f, y + 0.03f, 0.12f, 0.06f, "Up");
+        drawButton(x + 0.16f, y + 0.03f, 0.12f, 0.06f, "App");
+        drawButton(x + 0.29f, y + 0.03f, 0.10f, 0.06f, "~");
+        drawButton(x + 0.40f, y + 0.03f, 0.12f, 0.06f, "Refresh");
+        drawButton(x + 0.03f, y + h - 0.08f, 0.14f, 0.06f, "Play", false, !browserQueueMode);
+        drawButton(x + 0.19f, y + h - 0.08f, 0.14f, 0.06f, "Queue", false, browserQueueMode);
+        drawButton(x + 0.35f, y + h - 0.08f, 0.16f, 0.06f,
+                   "Que(" + std::to_string(playlist.size()) + ")");
         drawButton(x + w - 0.35f, y + 0.03f, 0.14f, 0.06f, "Prev");
         drawButton(x + w - 0.19f, y + 0.03f, 0.14f, 0.06f, "Next");
         drawButton(x + w - 0.19f, y + h - 0.08f, 0.14f, 0.06f, "Close");
@@ -2317,7 +2428,11 @@ void drawSourceMenu() {
             if (idx >= total) break;
             float rowY = listTop - i * rowH;
             bool isDir = browserEntries[idx].second;
-            glColor3f(isDir ? 0.18f : 0.16f, isDir ? 0.22f : 0.16f, isDir ? 0.30f : 0.20f);
+            std::string full = isDir ? "" : (fs::path(browserPath) / browserEntries[idx].first).string();
+            bool queued = !isDir && std::find(playlist.begin(), playlist.end(), full) != playlist.end();
+            glColor3f(isDir ? 0.18f : (queued ? 0.12f : 0.16f),
+                      isDir ? 0.22f : (queued ? 0.28f : 0.16f),
+                      isDir ? 0.30f : (queued ? 0.18f : 0.20f));
             glBegin(GL_QUADS);
             glVertex2f(x + 0.03f, rowY - 0.015f);
             glVertex2f(x + w - 0.03f, rowY - 0.015f);
@@ -2325,8 +2440,52 @@ void drawSourceMenu() {
             glVertex2f(x + 0.03f, rowY + 0.045f);
             glEnd();
             glColor3f(isDir ? 0.75f : 0.95f, isDir ? 0.85f : 0.95f, 1.0f);
-            std::string prefix = isDir ? "[DIR] " : "      ";
+            std::string prefix = isDir ? "[DIR] " : (queued ? "[Q]   " : "      ");
             drawText(x + 0.05f, rowY, truncateLabel(prefix + browserEntries[idx].first, 60));
+        }
+        glColor3f(0.7f, 0.75f, 0.85f);
+        drawText(x + 0.53f, y + h - 0.06f,
+                 browserQueueMode ? "Click file = add to queue" : "Click file = play now",
+                 GLUT_BITMAP_HELVETICA_10);
+    } else if (sourceMenuMode == SourceMenuMode::Queue) {
+        glColor3f(1.0f, 1.0f, 1.0f);
+        drawText(x + 0.03f, y + h - 0.05f, "Playback Queue", GLUT_BITMAP_HELVETICA_18);
+        {
+            std::ostringstream info;
+            info << playlist.size() << " item(s)  |  now #"
+                 << (playlist.empty() ? 0 : currentVideoIndex + 1);
+            drawText(x + 0.03f, y + h - 0.11f, info.str(), GLUT_BITMAP_HELVETICA_12);
+        }
+
+        drawButton(x + 0.03f, y + 0.03f, 0.16f, 0.06f, "Clear");
+        drawButton(x + 0.21f, y + 0.03f, 0.16f, 0.06f, "Rem");
+        drawButton(x + 0.39f, y + 0.03f, 0.16f, 0.06f, "Open");
+        drawButton(x + w - 0.35f, y + 0.03f, 0.14f, 0.06f, "Prev");
+        drawButton(x + w - 0.19f, y + 0.03f, 0.14f, 0.06f, "Next");
+        drawButton(x + w - 0.19f, y + h - 0.08f, 0.14f, 0.06f, "Close");
+
+        int total = static_cast<int>(playlist.size());
+        if (total == 0) {
+            glColor3f(0.7f, 0.7f, 0.75f);
+            drawText(x + 0.05f, listTop, "Queue empty.");
+        }
+        for (int i = 0; i < SOURCE_MENU_ROWS; ++i) {
+            int idx = queueScroll + i;
+            if (idx >= total) break;
+            float rowY = listTop - i * rowH;
+            bool cur = (idx == currentVideoIndex);
+            glColor3f(cur ? 0.15f : 0.16f, cur ? 0.32f : 0.16f, cur ? 0.22f : 0.22f);
+            glBegin(GL_QUADS);
+            glVertex2f(x + 0.03f, rowY - 0.015f);
+            glVertex2f(x + w - 0.03f, rowY - 0.015f);
+            glVertex2f(x + w - 0.03f, rowY + 0.045f);
+            glVertex2f(x + 0.03f, rowY + 0.045f);
+            glEnd();
+            glColor3f(0.95f, 0.95f, 1.0f);
+            std::ostringstream label;
+            label << (idx + 1) << ". " << playlistItemLabel(playlist[idx]);
+            if (cur) label << "  <<";
+            drawText(x + 0.05f, rowY, truncateLabel(label.str(), 62));
         }
     } else if (sourceMenuMode == SourceMenuMode::Cameras) {
         glColor3f(1.0f, 1.0f, 1.0f);
@@ -2419,7 +2578,7 @@ bool hitTestSourceMenu(float fx, float fy) {
     }
 
     if (sourceMenuMode == SourceMenuMode::Files) {
-        if (isInside(fx, fy, x + 0.03f, y + 0.03f, 0.16f, 0.06f)) {
+        if (isInside(fx, fy, x + 0.03f, y + 0.03f, 0.12f, 0.06f)) {
             fs::path parent = fs::path(browserPath).parent_path();
             if (!parent.empty()) {
                 browserPath = parent.string();
@@ -2428,15 +2587,33 @@ bool hitTestSourceMenu(float fx, float fy) {
             }
             return true;
         }
-        if (isInside(fx, fy, x + 0.22f, y + 0.03f, 0.16f, 0.06f)) {
+        if (isInside(fx, fy, x + 0.16f, y + 0.03f, 0.12f, 0.06f)) {
+            browserPath = !appRootPath.empty() ? appRootPath : ".";
+            browserScroll = 0;
+            refreshBrowserEntries();
+            return true;
+        }
+        if (isInside(fx, fy, x + 0.29f, y + 0.03f, 0.10f, 0.06f)) {
             const char* home = std::getenv("HOME");
             browserPath = home ? home : ".";
             browserScroll = 0;
             refreshBrowserEntries();
             return true;
         }
-        if (isInside(fx, fy, x + 0.41f, y + 0.03f, 0.16f, 0.06f)) {
+        if (isInside(fx, fy, x + 0.40f, y + 0.03f, 0.12f, 0.06f)) {
             refreshBrowserEntries();
+            return true;
+        }
+        if (isInside(fx, fy, x + 0.03f, y + h - 0.08f, 0.14f, 0.06f)) {
+            browserQueueMode = false;
+            return true;
+        }
+        if (isInside(fx, fy, x + 0.19f, y + h - 0.08f, 0.14f, 0.06f)) {
+            browserQueueMode = true;
+            return true;
+        }
+        if (isInside(fx, fy, x + 0.35f, y + h - 0.08f, 0.16f, 0.06f)) {
+            openQueueMenu();
             return true;
         }
         if (isInside(fx, fy, x + w - 0.35f, y + 0.03f, 0.14f, 0.06f)) {
@@ -2462,9 +2639,45 @@ bool hitTestSourceMenu(float fx, float fy) {
                     refreshBrowserEntries();
                 } else {
                     std::string full = (fs::path(browserPath) / entry.first).string();
-                    if (switchToSource(full))
+                    if (browserQueueMode) {
+                        enqueueSource(full, false);
+                    } else if (switchToSource(full)) {
                         closeSourceMenu();
+                    }
                 }
+                return true;
+            }
+        }
+    } else if (sourceMenuMode == SourceMenuMode::Queue) {
+        if (isInside(fx, fy, x + 0.03f, y + 0.03f, 0.16f, 0.06f)) {
+            clearPlaylistKeepCurrent();
+            return true;
+        }
+        if (isInside(fx, fy, x + 0.21f, y + 0.03f, 0.16f, 0.06f)) {
+            removePlaylistIndex(currentVideoIndex);
+            return true;
+        }
+        if (isInside(fx, fy, x + 0.39f, y + 0.03f, 0.16f, 0.06f)) {
+            openFileBrowserMenu();
+            return true;
+        }
+        if (isInside(fx, fy, x + w - 0.35f, y + 0.03f, 0.14f, 0.06f)) {
+            queueScroll = std::max(0, queueScroll - SOURCE_MENU_ROWS);
+            return true;
+        }
+        if (isInside(fx, fy, x + w - 0.19f, y + 0.03f, 0.14f, 0.06f)) {
+            int maxScroll = std::max(0, static_cast<int>(playlist.size()) - SOURCE_MENU_ROWS);
+            queueScroll = std::min(maxScroll, queueScroll + SOURCE_MENU_ROWS);
+            return true;
+        }
+
+        int total = static_cast<int>(playlist.size());
+        for (int i = 0; i < SOURCE_MENU_ROWS; ++i) {
+            int idx = queueScroll + i;
+            if (idx >= total) break;
+            float rowY = listTop - i * rowH;
+            if (isInside(fx, fy, x + 0.03f, rowY - 0.015f, w - 0.06f, 0.06f)) {
+                jumpToPlaylistIndex(idx);
                 return true;
             }
         }
@@ -3227,17 +3440,8 @@ void mouse(int button, int state, int x, int y) {
                 return;
             }
             else if (isInside(fx, fy, -0.27f, -0.85f, 0.12f * uiScale, 0.08f * uiScale)) {
-                if (!playlist.empty()) {
-                    currentVideoIndex = (currentVideoIndex + 1) % playlist.size();
-                    openVideoSource(playlist[currentVideoIndex]);
-                    if (cap.isOpened()) {
-                        double fps = cap.get(cv::CAP_PROP_FPS);
-                        double frames = cap.get(cv::CAP_PROP_FRAME_COUNT);
-                        videoDuration = (fps > 1e-3 && frames > 0) ? frames / fps : 0.0;
-                    } else if (windowCaptureActive) {
-                        videoDuration = 0.0;
-                    }
-                }
+                if (!playlist.empty())
+                    jumpToPlaylistIndex((currentVideoIndex + 1) % static_cast<int>(playlist.size()));
                 return;
             }
             else if (isInside(fx, fy, -0.10f, -0.85f, 0.12f * uiScale, 0.08f * uiScale)) {
@@ -3245,18 +3449,22 @@ void mouse(int button, int state, int x, int y) {
                 return;
             }
             else if (isInside(fx, fy, 0.07f, -0.85f, 0.12f * uiScale, 0.08f * uiScale)) {
-                openCameraMenu();
+                openQueueMenu();
                 return;
             }
             else if (isInside(fx, fy, 0.24f, -0.85f, 0.12f * uiScale, 0.08f * uiScale)) {
+                openCameraMenu();
+                return;
+            }
+            else if (isInside(fx, fy, 0.41f, -0.85f, 0.12f * uiScale, 0.08f * uiScale)) {
                 openWindowMenu();
                 return;
             }
-            else if (isInside(fx, fy, 0.41f, -0.85f, 0.13f * uiScale, 0.08f * uiScale)) {
+            else if (isInside(fx, fy, 0.58f, -0.85f, 0.13f * uiScale, 0.08f * uiScale)) {
                 setVideoFullscreen(!videoFullscreen);
                 return;
             }
-            else if (isInside(fx, fy, 0.58f, -0.85f, 0.13f * uiScale, 0.08f * uiScale)) {
+            else if (isInside(fx, fy, 0.75f, -0.85f, 0.13f * uiScale, 0.08f * uiScale)) {
                 setControlFullscreen(!controlFullscreen);
                 return;
             }
@@ -3493,11 +3701,8 @@ void keyboard(unsigned char key, int x, int y) {
             break;
         case 'n':
         case 'N':
-            currentVideoIndex = (currentVideoIndex + 1) % playlist.size();
-            openVideoSource(playlist[currentVideoIndex]);
-            if (cap.isOpened()) {
-                videoDuration = cap.get(cv::CAP_PROP_FRAME_COUNT) / cap.get(cv::CAP_PROP_FPS);
-            }
+            if (!playlist.empty())
+                jumpToPlaylistIndex((currentVideoIndex + 1) % static_cast<int>(playlist.size()));
             break;
         case 'f':
         case 'F':
@@ -3526,6 +3731,10 @@ void keyboard(unsigned char key, int x, int y) {
         case 'v':
         case 'V':
             openFileBrowserMenu();
+            break;
+        case 'q':
+        case 'Q':
+            openQueueMenu();
             break;
         case 'c':
         case 'C':
@@ -3994,13 +4203,7 @@ void processCaptureFrame() {
             if (isLooping) {
                 cap.set(cv::CAP_PROP_POS_FRAMES, 0);
             } else if (!playlist.empty()) {
-                currentVideoIndex = (currentVideoIndex + 1) % playlist.size();
-                openVideoSource(playlist[currentVideoIndex]);
-                if (cap.isOpened() || windowCaptureActive) {
-                    double fps = cap.isOpened() ? cap.get(cv::CAP_PROP_FPS) : 0.0;
-                    double frames = cap.isOpened() ? cap.get(cv::CAP_PROP_FRAME_COUNT) : 0.0;
-                    videoDuration = (fps > 1e-3 && frames > 0) ? frames / fps : 0.0;
-                }
+                jumpToPlaylistIndex((currentVideoIndex + 1) % static_cast<int>(playlist.size()));
             }
             return;
         }
@@ -4415,10 +4618,11 @@ void displayControlWindow() {
         drawButton(-0.44f, -0.85f, 0.12f * uiScale, 0.08f * uiScale, isLooping ? "Loop" : "NoLoop");
         drawButton(-0.27f, -0.85f, 0.12f * uiScale, 0.08f * uiScale, "Next");
         drawButton(-0.10f, -0.85f, 0.12f * uiScale, 0.08f * uiScale, "Open");
-        drawButton(0.07f, -0.85f, 0.12f * uiScale, 0.08f * uiScale, "Cam");
-        drawButton(0.24f, -0.85f, 0.12f * uiScale, 0.08f * uiScale, "Win");
-        drawButton(0.41f, -0.85f, 0.13f * uiScale, 0.08f * uiScale, "Vid FS", false, videoFullscreen);
-        drawButton(0.58f, -0.85f, 0.13f * uiScale, 0.08f * uiScale, "Ctl FS", false, controlFullscreen);
+        drawButton(0.07f, -0.85f, 0.12f * uiScale, 0.08f * uiScale, "Que");
+        drawButton(0.24f, -0.85f, 0.12f * uiScale, 0.08f * uiScale, "Cam");
+        drawButton(0.41f, -0.85f, 0.12f * uiScale, 0.08f * uiScale, "Win");
+        drawButton(0.58f, -0.85f, 0.13f * uiScale, 0.08f * uiScale, "Vid FS", false, videoFullscreen);
+        drawButton(0.75f, -0.85f, 0.13f * uiScale, 0.08f * uiScale, "Ctl FS", false, controlFullscreen);
 
         drawFilterListPanel();
 
@@ -4429,7 +4633,7 @@ void displayControlWindow() {
         drawFormatPanel();
         drawActiveEffectsPanel();
 
-        drawText(-0.95f, 0.95f, "F Vid FS | H Ctl FS | V Open | C Cam | I Win capture");
+        drawText(-0.95f, 0.95f, "F Vid FS | H Ctl FS | V Open | Q Queue | C Cam | I Win");
         drawText(-0.95f, 0.90f, "Aspect/Res under Filters | Bord hides guide | Def=native res");
         if (formatAspectActive() || forceResActive()) {
             std::ostringstream fmt;
@@ -4603,6 +4807,8 @@ void updateVideoTime() {
 
 int main(int argc, char** argv) {
     XInitThreads();
+    appRootPath = resolveAppRoot(argv[0] ? argv[0] : "");
+    browserPath = appRootPath;
     auto parseIntArg = [](const std::string& s, int& out) -> bool {
         try { out = std::stoi(s); return true; } catch (...) { return false; }
     };
@@ -4693,6 +4899,13 @@ int main(int argc, char** argv) {
         } else if (arg == "--preset" && i + 1 < argc) {
             // applied after GLUT init
             playlist.push_back(std::string("__preset__") + argv[++i]);
+        } else if (arg == "--queue" || arg == "--playlist") {
+            // Consume following non-option args into the playback queue
+            while (i + 1 < argc) {
+                std::string next = argv[i + 1];
+                if (next.rfind("--", 0) == 0) break;
+                playlist.push_back(argv[++i]);
+            }
         } else if (arg.rfind("--", 0) == 0) {
             std::cerr << "Unknown option: " << arg << std::endl;
         } else
@@ -4709,6 +4922,30 @@ int main(int argc, char** argv) {
         return false;
     }), playlist.end());
 
+    // Resolve relative media paths (cwd first, then app executable folder)
+    for (auto& item : playlist) {
+        if (item.empty() || isCameraSourceId(item) ||
+            item.rfind("win:", 0) == 0 || item == "screen")
+            continue;
+        std::error_code ec;
+        fs::path p(item);
+        if (p.is_absolute()) {
+            item = fs::weakly_canonical(p, ec).string();
+            if (ec) item = p.string();
+            continue;
+        }
+        if (fs::exists(p, ec)) {
+            item = fs::weakly_canonical(fs::absolute(p), ec).string();
+            if (ec) item = fs::absolute(p).string();
+            continue;
+        }
+        fs::path fromApp = fs::path(appRootPath) / p;
+        if (fs::exists(fromApp, ec)) {
+            item = fs::weakly_canonical(fromApp, ec).string();
+            if (ec) item = fromApp.string();
+        }
+    }
+
     if (playlist.empty()) playlist.push_back("0");
 
     // Initialize video capture
@@ -4716,6 +4953,7 @@ int main(int argc, char** argv) {
         std::cerr << "Failed to open source." << std::endl;
         return -1;
     }
+    currentVideoIndex = 0;
 
     // Get video duration
     {
