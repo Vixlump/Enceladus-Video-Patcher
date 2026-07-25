@@ -62,8 +62,8 @@ int controlSavedX = 920, controlSavedY = 80, controlSavedW = 960, controlSavedH 
 int windowWidth = 960, windowHeight = 720;
 float uiScale = 1.0f;
 int activeSlider = -1; // -1 means no slider is active
-// Encodes activeSlider as filterIdx * AE_SLIDER_STRIDE + paramType (0=strength .. 15=param15)
-const int AE_SLIDER_STRIDE = 16;
+// Encodes activeSlider as filterIdx * AE_SLIDER_STRIDE + paramType (0=strength .. 17=param17)
+const int AE_SLIDER_STRIDE = 18;
 float aePanelScroll = 0.0f; // scroll offset for tall Active Effects lists
 bool isSeeking = false;
 double videoDuration = 0;
@@ -283,6 +283,10 @@ public:
     virtual std::string param13Name() const { return ""; }
     virtual std::string param14Name() const { return ""; }
     virtual std::string param15Name() const { return ""; }
+    virtual bool hasParam16() const { return false; }
+    virtual bool hasParam17() const { return false; }
+    virtual std::string param16Name() const { return ""; }
+    virtual std::string param17Name() const { return ""; }
     virtual bool hasReset() const { return false; }
     virtual void reset() {}
     // Optional calibration / tool buttons drawn under a filter's sliders
@@ -291,6 +295,13 @@ public:
     virtual bool toolButtonActive(int /*i*/) const { return false; }
     virtual void toolButtonClick(int /*i*/) {}
     virtual std::string statusLine() const { return ""; }
+
+    // Option pages keep dense filters (EnceladusVision) from dumping every slider at once
+    int optionPage = 0;
+    virtual int optionPageCount() const { return 1; }
+    virtual std::string optionPageName(int /*i*/) const { return "Params"; }
+    virtual bool showStrengthOnPage() const { return hasStrength(); }
+    virtual bool showParamOnPage(int /*paramIndex1to17*/) const { return true; }
     
     bool enabled = false;
     float strength = 1.0f;
@@ -309,6 +320,8 @@ public:
     float param13 = 0.5f;
     float param14 = 0.45f;
     float param15 = 0.35f;
+    float param16 = 0.55f;
+    float param17 = 0.45f;
     virtual ~VideoFilter() = default;
 };
 
@@ -636,12 +649,14 @@ class EnceladusVisionFilter : public VideoFilter {
 
     cv::Ptr<cv::BackgroundSubtractor> subtractor;
     std::vector<Track> tracks;
-    cv::Mat lastMotion; // for calibration overlay
+    cv::Mat lastMotion; // for calibration overlay + Mot3D height
+    cv::Mat motionHeight; // smoothed motion field 0..1
     bool showTracks = false;
     bool showMotion = false;
     bool showHeight = false;
     bool showEdges = false;
     bool anaglyphOn = true;
+    bool motion3DOn = false;
     static constexpr int kGrid = 80;
 
     struct EdgeTrack {
@@ -1018,6 +1033,18 @@ class EnceladusVisionFilter : public VideoFilter {
         float oy = 0.0f;
     };
 
+    struct WaveSample {
+        float h = 0.0f;
+        float ox = 0.0f;
+        float oy = 0.0f;
+    };
+
+    static float popScaleCurve(float t) {
+        t = std::max(0.0f, std::min(1.0f, t));
+        const float shaped = std::pow(t, 2.35f);
+        return 0.012f + shaped * 2.98f;
+    }
+
     // Push mesh sides apart across persistent, lerped edge tracks.
     EdgeSample sampleEdgeSplit(float u, float v, int frameW, int frameH) const {
         EdgeSample out;
@@ -1077,19 +1104,60 @@ class EnceladusVisionFilter : public VideoFilter {
         return out;
     }
 
-    // Pop Scale slider: fine fractional control at the low end, still reaches a large high end.
-    static float popScaleCurve(float t) {
-        t = std::max(0.0f, std::min(1.0f, t));
-        // pow>1 keeps most of the slider in the subtle range, then ramps up hard
-        const float shaped = std::pow(t, 2.35f);
-        return 0.012f + shaped * 2.98f; // ~0.01 .. ~3.0
+    void updateMotionField() {
+        if (!motion3DOn || lastMotion.empty()) {
+            motionHeight.release();
+            return;
+        }
+        cv::Mat f;
+        lastMotion.convertTo(f, CV_32FC1, 1.0 / 255.0);
+        int k = 3 + static_cast<int>(std::max(0.0f, std::min(1.0f, param17)) * 14.0f) * 2; // odd
+        if (k % 2 == 0) ++k;
+        cv::GaussianBlur(f, motionHeight, cv::Size(k, k), 0);
     }
 
-    struct WaveSample {
-        float h = 0.0f;
-        float ox = 0.0f; // world X lean from motion
-        float oy = 0.0f; // world Y lean from motion
-    };
+    // Mot3D: extrude the mesh from the motion mask / field.
+    WaveSample sampleMotion3D(float u, float v, int frameW, int frameH) const {
+        WaveSample out;
+        if (!motion3DOn || motionHeight.empty()) return out;
+        const float depth = std::max(0.0f, std::min(1.0f, param16));
+        if (depth < 0.01f) return out;
+
+        float x = u * (motionHeight.cols - 1);
+        float y = v * (motionHeight.rows - 1);
+        int x0 = std::max(0, std::min(motionHeight.cols - 1, static_cast<int>(std::floor(x))));
+        int y0 = std::max(0, std::min(motionHeight.rows - 1, static_cast<int>(std::floor(y))));
+        int x1 = std::max(0, std::min(motionHeight.cols - 1, x0 + 1));
+        int y1 = std::max(0, std::min(motionHeight.rows - 1, y0 + 1));
+        float tx = x - x0, ty = y - y0;
+        float m00 = motionHeight.at<float>(y0, x0);
+        float m10 = motionHeight.at<float>(y0, x1);
+        float m01 = motionHeight.at<float>(y1, x0);
+        float m11 = motionHeight.at<float>(y1, x1);
+        float m = (m00 * (1 - tx) + m10 * tx) * (1 - ty) + (m01 * (1 - tx) + m11 * tx) * ty;
+
+        const float pop = popScaleCurve(param6);
+        out.h = m * depth * (0.06f + strength * 0.85f) * pop;
+
+        // Tip along local motion gradient (cheap finite difference)
+        float gx = 0.0f, gy = 0.0f;
+        if (x0 > 0 && x1 < motionHeight.cols - 1) {
+            gx = motionHeight.at<float>(y0, std::min(motionHeight.cols - 1, x0 + 1))
+               - motionHeight.at<float>(y0, std::max(0, x0 - 1));
+        }
+        if (y0 > 0 && y1 < motionHeight.rows - 1) {
+            gy = motionHeight.at<float>(std::min(motionHeight.rows - 1, y0 + 1), x0)
+               - motionHeight.at<float>(std::max(0, y0 - 1), x0);
+        }
+        float gLen = std::sqrt(gx * gx + gy * gy);
+        if (gLen > 1e-4f && m > 0.08f) {
+            float lean = depth * m * out.h * 0.55f;
+            out.ox = (gx / gLen) * lean;
+            out.oy = -(gy / gLen) * lean; // image Y down → world Y up
+        }
+        (void)frameW; (void)frameH;
+        return out;
+    }
 
     // Raised-cosine mound; depth scales with track size; tips toward motion.
     WaveSample sampleWave(float u, float v, int frameW, int frameH) const {
@@ -1154,7 +1222,9 @@ class EnceladusVisionFilter : public VideoFilter {
     }
 
     float heightAt(float u, float v, int frameW, int frameH) const {
-        return sampleWave(u, v, frameW, frameH).h + sampleEdgeSplit(u, v, frameW, frameH).h;
+        return sampleWave(u, v, frameW, frameH).h
+             + sampleEdgeSplit(u, v, frameW, frameH).h
+             + sampleMotion3D(u, v, frameW, frameH).h;
     }
 
     cv::Mat buildHeightMap(int rows, int cols) const {
@@ -1217,6 +1287,7 @@ public:
 
         updateTracks(frame);
         updateEdges(frame);
+        updateMotionField();
 
         // Always render a textured mesh. Frontal (yaw=0.5, pitch=0) maps the flat
         // plane 1:1 into the frame; extruded tracks pop toward the camera. Orbit
@@ -1257,9 +1328,10 @@ public:
                 float py = (0.5f - v) * 2.0f;
                 WaveSample w = sampleWave(u, v, frame.cols, frame.rows);
                 EdgeSample e = sampleEdgeSplit(u, v, frame.cols, frame.rows);
-                px += w.ox + e.ox;
-                py += w.oy + e.oy;
-                float pz = w.h + e.h;
+                WaveSample m = sampleMotion3D(u, v, frame.cols, frame.rows);
+                px += w.ox + e.ox + m.ox;
+                py += w.oy + e.oy + m.oy;
+                float pz = w.h + e.h + m.h;
 
                 // Yaw around Y, then pitch around X
                 float x1 = px * cy + pz * sy;
@@ -1401,12 +1473,17 @@ public:
         param13 = 0.22f; // Edge Sense (conservative)
         param14 = 0.55f; // Edge Lerp
         param15 = 0.40f; // Anticipate
+        param16 = 0.55f; // Mot Depth
+        param17 = 0.45f; // Mot Soft
         anaglyphOn = true;
+        motion3DOn = false;
+        optionPage = 0;
     }
 
     void resetTracking() {
         tracks.clear();
         lastMotion.release();
+        motionHeight.release();
         subtractor.release();
         edgeTracks.clear();
     }
@@ -1418,6 +1495,8 @@ public:
         showMotion = false;
         showHeight = false;
         showEdges = false;
+        motion3DOn = false;
+        optionPage = 0;
     }
 
     std::string name() const override { return "EnceladusVision"; }
@@ -1436,6 +1515,8 @@ public:
     bool hasParam13() const override { return true; }
     bool hasParam14() const override { return true; }
     bool hasParam15() const override { return true; }
+    bool hasParam16() const override { return true; }
+    bool hasParam17() const override { return true; }
     std::string param1Name() const override { return "Strictness"; }
     std::string param2Name() const override { return "Wave Soft"; }
     std::string param3Name() const override { return "Wave Radius"; }
@@ -1451,42 +1532,70 @@ public:
     std::string param13Name() const override { return "Edge Sense"; }
     std::string param14Name() const override { return "Edge Lerp"; }
     std::string param15Name() const override { return "Anticipate"; }
+    std::string param16Name() const override { return "Mot Depth"; }
+    std::string param17Name() const override { return "Mot Soft"; }
     bool hasReset() const override { return true; }
 
-    int toolButtonCount() const override { return 8; }
+    int optionPageCount() const override { return 5; }
+    std::string optionPageName(int i) const override {
+        switch (i) {
+            case 0: return "Pop";
+            case 1: return "Time";
+            case 2: return "Edge";
+            case 3: return "Look";
+            case 4: return "Mot3D";
+            default: return "Params";
+        }
+    }
+    bool showStrengthOnPage() const override { return optionPage == 0; }
+    bool showParamOnPage(int n) const override {
+        switch (optionPage) {
+            case 0: return n == 1 || n == 2 || n == 3 || n == 6 || n == 7 || n == 9 || n == 10;
+            case 1: return n == 11 || n == 15;
+            case 2: return n == 12 || n == 13 || n == 14;
+            case 3: return n == 4 || n == 5 || n == 8;
+            case 4: return n == 16 || n == 17;
+            default: return true;
+        }
+    }
+
+    int toolButtonCount() const override { return 9; }
     std::string toolButtonName(int i) const override {
         switch (i) {
-            case 0: return "Reset";
-            case 1: return "Front";
-            case 2: return anaglyphOn ? "Ana ON" : "Ana OFF";
-            case 3: return "Tracks";
-            case 4: return "Motion";
-            case 5: return "Height";
-            case 6: return "Edges";
-            case 7: return "Relearn";
+            case 0: return motion3DOn ? "Mot3D ON" : "Mot3D";
+            case 1: return anaglyphOn ? "Ana ON" : "Ana OFF";
+            case 2: return "Front";
+            case 3: return "Reset";
+            case 4: return "Tracks";
+            case 5: return "Motion";
+            case 6: return "Height";
+            case 7: return "Edges";
+            case 8: return "Relearn";
             default: return "";
         }
     }
     bool toolButtonActive(int i) const override {
         switch (i) {
-            case 2: return anaglyphOn;
-            case 3: return showTracks;
-            case 4: return showMotion;
-            case 5: return showHeight;
-            case 6: return showEdges;
+            case 0: return motion3DOn;
+            case 1: return anaglyphOn;
+            case 4: return showTracks;
+            case 5: return showMotion;
+            case 6: return showHeight;
+            case 7: return showEdges;
             default: return false;
         }
     }
     void toolButtonClick(int i) override {
         switch (i) {
-            case 0: reset(); break;
-            case 1: param4 = 0.5f; param5 = 0.0f; break;
-            case 2: anaglyphOn = !anaglyphOn; break;
-            case 3: showTracks = !showTracks; break;
-            case 4: showMotion = !showMotion; break;
-            case 5: showHeight = !showHeight; break;
-            case 6: showEdges = !showEdges; break;
-            case 7: resetTracking(); break;
+            case 0: motion3DOn = !motion3DOn; if (motion3DOn) optionPage = 4; break;
+            case 1: anaglyphOn = !anaglyphOn; break;
+            case 2: param4 = 0.5f; param5 = 0.0f; break;
+            case 3: reset(); break;
+            case 4: showTracks = !showTracks; break;
+            case 5: showMotion = !showMotion; break;
+            case 6: showHeight = !showHeight; break;
+            case 7: showEdges = !showEdges; break;
+            case 8: resetTracking(); break;
             default: break;
         }
     }
@@ -1498,11 +1607,13 @@ public:
         int liveEdges = 0;
         for (const auto& e : edgeTracks)
             if (e.blend > 0.45f) ++liveEdges;
-        std::string ana = anaglyphOn ? "ana on" : "ana off";
-        return "tracks " + std::to_string(tracks.size()) +
-               "  live " + std::to_string(mature) +
-               "  edges " + std::to_string(liveEdges) + "/" + std::to_string(edgeTracks.size()) +
-               "  " + ana;
+        std::ostringstream ss;
+        ss << optionPageName(optionPage)
+           << " | tr " << tracks.size() << "/" << mature
+           << " ed " << liveEdges << "/" << edgeTracks.size()
+           << (motion3DOn ? " | Mot3D" : "")
+           << (anaglyphOn ? " | ana" : "");
+        return ss.str();
     }
 };
 
@@ -3210,22 +3321,26 @@ bool hitTestFilterListPanel(float fx, float fy) {
     return true; // absorb clicks inside panel chrome
 }
 
-// Active-effects panel on the left — tall enough for multiple filter sliders.
+// Active-effects panel on the left — kept above timeline / view transport.
 const float AE_PANEL_X = -0.95f;
 const float AE_PANEL_W = 0.48f;
 const float AE_CONTENT_X = -0.93f;
 const float AE_SLIDER_W = 0.42f;
-const float AE_SLIDER_H = 0.025f;
-const float AE_TOP_Y = 0.82f;
-const float AE_TITLE_STEP = 0.06f;
-const float AE_NAME_STEP = 0.05f;
-const float AE_SLIDER_STEP = 0.07f;
+const float AE_SLIDER_H = 0.020f;
+const float AE_TOP_Y = 0.78f;
+const float AE_TITLE_STEP = 0.085f;   // room under "Active Effects" header
+const float AE_NAME_STEP = 0.048f;
+const float AE_LABEL_STEP = 0.030f;   // slider name row
+const float AE_SLIDER_GAP = 0.022f;   // gap after track before next label
+const float AE_PARAM_STEP = AE_LABEL_STEP + AE_SLIDER_H + AE_SLIDER_GAP;
 const float AE_FILTER_GAP = 0.035f;
-const float AE_BOTTOM_LIMIT = -0.88f;
-const float AE_TOOL_H = 0.045f;
+const float AE_BOTTOM_LIMIT = -0.58f;
+const float AE_PAGE_BAR_H = 0.058f;   // fixed page footer (not scrolled)
+const float AE_TOOL_H = 0.038f;
 const float AE_TOOL_GAP = 0.01f;
-const float AE_TOOL_ROW = 0.055f;
-const float AE_STATUS_STEP = 0.04f;
+const float AE_TOOL_ROW = 0.050f;
+const float AE_STATUS_STEP = 0.038f;
+const float AE_TOOLS_PAD = 0.018f;    // gap before tool buttons
 
 bool anyFilterEnabled() {
     for (const auto& filter : filters) {
@@ -3234,33 +3349,62 @@ bool anyFilterEnabled() {
     return false;
 }
 
+static bool aeShowsStrength(const std::unique_ptr<VideoFilter>& f) {
+    return f->hasStrength() && f->showStrengthOnPage();
+}
+static bool aeShowsParam(const std::unique_ptr<VideoFilter>& f, int n) {
+    auto has = [&](int i) -> bool {
+        switch (i) {
+            case 1: return f->hasParam1(); case 2: return f->hasParam2();
+            case 3: return f->hasParam3(); case 4: return f->hasParam4();
+            case 5: return f->hasParam5(); case 6: return f->hasParam6();
+            case 7: return f->hasParam7(); case 8: return f->hasParam8();
+            case 9: return f->hasParam9(); case 10: return f->hasParam10();
+            case 11: return f->hasParam11(); case 12: return f->hasParam12();
+            case 13: return f->hasParam13(); case 14: return f->hasParam14();
+            case 15: return f->hasParam15(); case 16: return f->hasParam16();
+            case 17: return f->hasParam17();
+            default: return false;
+        }
+    };
+    return has(n) && f->showParamOnPage(n);
+}
+
+static bool aeNeedsPageBar() {
+    for (const auto& filter : filters) {
+        if (filter->enabled && filter->optionPageCount() > 1)
+            return true;
+    }
+    return false;
+}
+
+static float aeScrollBottom() {
+    return aeNeedsPageBar() ? (AE_BOTTOM_LIMIT + AE_PAGE_BAR_H) : AE_BOTTOM_LIMIT;
+}
+
+static VideoFilter* aePagedFilter() {
+    for (auto& filter : filters) {
+        if (filter->enabled && filter->optionPageCount() > 1)
+            return filter.get();
+    }
+    return nullptr;
+}
+
 float activeEffectsContentHeight() {
     float h = AE_TITLE_STEP;
     for (const auto& filter : filters) {
         if (!filter->enabled) continue;
         h += AE_NAME_STEP;
-        if (filter->hasStrength()) h += AE_SLIDER_STEP;
-        if (filter->hasParam1()) h += AE_SLIDER_STEP;
-        if (filter->hasParam2()) h += AE_SLIDER_STEP;
-        if (filter->hasParam3()) h += AE_SLIDER_STEP;
-        if (filter->hasParam4()) h += AE_SLIDER_STEP;
-        if (filter->hasParam5()) h += AE_SLIDER_STEP;
-        if (filter->hasParam6()) h += AE_SLIDER_STEP;
-        if (filter->hasParam7()) h += AE_SLIDER_STEP;
-        if (filter->hasParam8()) h += AE_SLIDER_STEP;
-        if (filter->hasParam9()) h += AE_SLIDER_STEP;
-        if (filter->hasParam10()) h += AE_SLIDER_STEP;
-        if (filter->hasParam11()) h += AE_SLIDER_STEP;
-        if (filter->hasParam12()) h += AE_SLIDER_STEP;
-        if (filter->hasParam13()) h += AE_SLIDER_STEP;
-        if (filter->hasParam14()) h += AE_SLIDER_STEP;
-        if (filter->hasParam15()) h += AE_SLIDER_STEP;
+        if (!filter->statusLine().empty()) h += AE_STATUS_STEP;
+        if (aeShowsStrength(filter)) h += AE_PARAM_STEP;
+        for (int p = 1; p <= 17; ++p)
+            if (aeShowsParam(filter, p)) h += AE_PARAM_STEP;
         int tools = filter->toolButtonCount();
         if (tools > 0) {
+            h += AE_TOOLS_PAD;
             int rows = (tools + 1) / 2;
             h += rows * AE_TOOL_ROW + 0.01f;
         }
-        if (!filter->statusLine().empty()) h += AE_STATUS_STEP;
         h += AE_FILTER_GAP;
     }
     return h;
@@ -3268,9 +3412,27 @@ float activeEffectsContentHeight() {
 
 void clampAePanelScroll() {
     const float contentH = activeEffectsContentHeight();
-    const float viewH = AE_TOP_Y - AE_BOTTOM_LIMIT;
+    const float viewH = AE_TOP_Y - aeScrollBottom();
     float maxScroll = std::max(0.0f, contentH - viewH);
     aePanelScroll = std::max(0.0f, std::min(aePanelScroll, maxScroll));
+}
+
+void drawSliderTrackOnly(float x, float y, float w, float h, float value) {
+    glColor3f(sliderTrackColor.r, sliderTrackColor.g, sliderTrackColor.b);
+    glBegin(GL_QUADS);
+    glVertex2f(x, y);
+    glVertex2f(x + w, y);
+    glVertex2f(x + w, y + h);
+    glVertex2f(x, y + h);
+    glEnd();
+    float thumbPos = x + (w - h) * value;
+    glColor3f(sliderThumbColor.r, sliderThumbColor.g, sliderThumbColor.b);
+    glBegin(GL_QUADS);
+    glVertex2f(thumbPos, y);
+    glVertex2f(thumbPos + h, y);
+    glVertex2f(thumbPos + h, y + h);
+    glVertex2f(thumbPos, y + h);
+    glEnd();
 }
 
 void drawActiveEffectsPanel() {
@@ -3278,15 +3440,16 @@ void drawActiveEffectsPanel() {
 
     clampAePanelScroll();
     const float contentH = activeEffectsContentHeight();
-    const float listY = AE_BOTTOM_LIMIT;
-    const float viewH = AE_TOP_Y - AE_BOTTOM_LIMIT;
+    const float listY = aeScrollBottom();
+    const float viewH = AE_TOP_Y - listY;
+    const bool pageBar = aeNeedsPageBar();
 
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glColor4f(0.08f, 0.08f, 0.12f, 0.82f);
     glBegin(GL_QUADS);
-    glVertex2f(AE_PANEL_X, listY);
-    glVertex2f(AE_PANEL_X + AE_PANEL_W, listY);
+    glVertex2f(AE_PANEL_X, AE_BOTTOM_LIMIT);
+    glVertex2f(AE_PANEL_X + AE_PANEL_W, AE_BOTTOM_LIMIT);
     glVertex2f(AE_PANEL_X + AE_PANEL_W, AE_TOP_Y);
     glVertex2f(AE_PANEL_X, AE_TOP_Y);
     glEnd();
@@ -3294,26 +3457,27 @@ void drawActiveEffectsPanel() {
     glColor4f(0.35f, 0.35f, 0.45f, 0.95f);
     glLineWidth(1.5f);
     glBegin(GL_LINE_LOOP);
-    glVertex2f(AE_PANEL_X, listY);
-    glVertex2f(AE_PANEL_X + AE_PANEL_W, listY);
+    glVertex2f(AE_PANEL_X, AE_BOTTOM_LIMIT);
+    glVertex2f(AE_PANEL_X + AE_PANEL_W, AE_BOTTOM_LIMIT);
     glVertex2f(AE_PANEL_X + AE_PANEL_W, AE_TOP_Y);
     glVertex2f(AE_PANEL_X, AE_TOP_Y);
     glEnd();
     glDisable(GL_BLEND);
 
     glColor3f(1.0f, 1.0f, 1.0f);
-    drawText(AE_CONTENT_X, AE_TOP_Y - 0.04f, "Active Effects", GLUT_BITMAP_HELVETICA_18);
+    drawText(AE_CONTENT_X, AE_TOP_Y - 0.035f, "Active Effects", GLUT_BITMAP_HELVETICA_18);
     if (contentH > viewH + 0.01f) {
         glColor3f(0.65f, 0.65f, 0.75f);
-        drawText(AE_CONTENT_X + 0.28f, AE_TOP_Y - 0.04f, "scroll", GLUT_BITMAP_HELVETICA_10);
+        drawText(AE_CONTENT_X + 0.30f, AE_TOP_Y - 0.035f, "scroll", GLUT_BITMAP_HELVETICA_10);
     }
 
+    // Clip scrolled content above the page footer
     float currentY = AE_TOP_Y - AE_TITLE_STEP + aePanelScroll;
     for (size_t i = 0; i < filters.size(); ++i) {
         if (!filters[i]->enabled) continue;
 
         auto inView = [&](float yBot, float yTop) {
-            return yTop >= listY + 0.02f && yBot <= AE_TOP_Y - 0.05f;
+            return yTop >= listY + 0.01f && yBot <= AE_TOP_Y - AE_TITLE_STEP + 0.02f;
         };
 
         if (inView(currentY - 0.02f, currentY + 0.02f)) {
@@ -3322,36 +3486,55 @@ void drawActiveEffectsPanel() {
         }
         currentY -= AE_NAME_STEP;
 
-        auto drawParam = [&](float& value, const std::string& label) {
+        // Status under filter name (not under tools)
+        std::string status = filters[i]->statusLine();
+        if (!status.empty()) {
+            if (inView(currentY - 0.02f, currentY + 0.02f)) {
+                glColor3f(0.65f, 0.8f, 0.7f);
+                drawText(AE_CONTENT_X, currentY, status, GLUT_BITMAP_HELVETICA_10);
+            }
+            currentY -= AE_STATUS_STEP;
+        }
+
+        auto drawParam = [&](float value, const std::string& label) {
+            if (inView(currentY - AE_PARAM_STEP, currentY + 0.01f)) {
+                char valBuf[32];
+                std::snprintf(valBuf, sizeof(valBuf), "%.2f", value);
+                glColor3f(0.78f, 0.78f, 0.88f);
+                drawText(AE_CONTENT_X, currentY, label + "  " + valBuf, GLUT_BITMAP_HELVETICA_10);
+            }
+            currentY -= AE_LABEL_STEP;
             float sy = currentY - AE_SLIDER_H;
-            if (inView(sy, currentY + 0.02f))
-                drawSlider(AE_CONTENT_X, sy, AE_SLIDER_W, AE_SLIDER_H, value, label);
-            currentY -= AE_SLIDER_STEP;
+            if (inView(sy, currentY + 0.01f))
+                drawSliderTrackOnly(AE_CONTENT_X, sy, AE_SLIDER_W, AE_SLIDER_H, value);
+            currentY -= (AE_SLIDER_H + AE_SLIDER_GAP);
         };
 
-        if (filters[i]->hasStrength()) drawParam(filters[i]->strength, "Strength");
-        if (filters[i]->hasParam1()) drawParam(filters[i]->param1, filters[i]->param1Name());
-        if (filters[i]->hasParam2()) drawParam(filters[i]->param2, filters[i]->param2Name());
-        if (filters[i]->hasParam3()) drawParam(filters[i]->param3, filters[i]->param3Name());
-        if (filters[i]->hasParam4()) drawParam(filters[i]->param4, filters[i]->param4Name());
-        if (filters[i]->hasParam5()) drawParam(filters[i]->param5, filters[i]->param5Name());
-        if (filters[i]->hasParam6()) drawParam(filters[i]->param6, filters[i]->param6Name());
-        if (filters[i]->hasParam7()) drawParam(filters[i]->param7, filters[i]->param7Name());
-        if (filters[i]->hasParam8()) drawParam(filters[i]->param8, filters[i]->param8Name());
-        if (filters[i]->hasParam9()) drawParam(filters[i]->param9, filters[i]->param9Name());
-        if (filters[i]->hasParam10()) drawParam(filters[i]->param10, filters[i]->param10Name());
-        if (filters[i]->hasParam11()) drawParam(filters[i]->param11, filters[i]->param11Name());
-        if (filters[i]->hasParam12()) drawParam(filters[i]->param12, filters[i]->param12Name());
-        if (filters[i]->hasParam13()) drawParam(filters[i]->param13, filters[i]->param13Name());
-        if (filters[i]->hasParam14()) drawParam(filters[i]->param14, filters[i]->param14Name());
-        if (filters[i]->hasParam15()) drawParam(filters[i]->param15, filters[i]->param15Name());
+        if (aeShowsStrength(filters[i])) drawParam(filters[i]->strength, "Strength");
+        if (aeShowsParam(filters[i], 1)) drawParam(filters[i]->param1, filters[i]->param1Name());
+        if (aeShowsParam(filters[i], 2)) drawParam(filters[i]->param2, filters[i]->param2Name());
+        if (aeShowsParam(filters[i], 3)) drawParam(filters[i]->param3, filters[i]->param3Name());
+        if (aeShowsParam(filters[i], 4)) drawParam(filters[i]->param4, filters[i]->param4Name());
+        if (aeShowsParam(filters[i], 5)) drawParam(filters[i]->param5, filters[i]->param5Name());
+        if (aeShowsParam(filters[i], 6)) drawParam(filters[i]->param6, filters[i]->param6Name());
+        if (aeShowsParam(filters[i], 7)) drawParam(filters[i]->param7, filters[i]->param7Name());
+        if (aeShowsParam(filters[i], 8)) drawParam(filters[i]->param8, filters[i]->param8Name());
+        if (aeShowsParam(filters[i], 9)) drawParam(filters[i]->param9, filters[i]->param9Name());
+        if (aeShowsParam(filters[i], 10)) drawParam(filters[i]->param10, filters[i]->param10Name());
+        if (aeShowsParam(filters[i], 11)) drawParam(filters[i]->param11, filters[i]->param11Name());
+        if (aeShowsParam(filters[i], 12)) drawParam(filters[i]->param12, filters[i]->param12Name());
+        if (aeShowsParam(filters[i], 13)) drawParam(filters[i]->param13, filters[i]->param13Name());
+        if (aeShowsParam(filters[i], 14)) drawParam(filters[i]->param14, filters[i]->param14Name());
+        if (aeShowsParam(filters[i], 15)) drawParam(filters[i]->param15, filters[i]->param15Name());
+        if (aeShowsParam(filters[i], 16)) drawParam(filters[i]->param16, filters[i]->param16Name());
+        if (aeShowsParam(filters[i], 17)) drawParam(filters[i]->param17, filters[i]->param17Name());
 
         int tools = filters[i]->toolButtonCount();
         if (tools > 0) {
+            currentY -= AE_TOOLS_PAD;
             const float btnW = (AE_SLIDER_W - AE_TOOL_GAP) * 0.5f;
             for (int t = 0; t < tools; ++t) {
                 int col = t % 2;
-                if (col == 0 && t > 0) { /* row already advanced below */ }
                 float bx = AE_CONTENT_X + col * (btnW + AE_TOOL_GAP);
                 float by = currentY - AE_TOOL_H;
                 if (inView(by, currentY)) {
@@ -3364,66 +3547,116 @@ void drawActiveEffectsPanel() {
             }
         }
 
-        std::string status = filters[i]->statusLine();
-        if (!status.empty()) {
-            if (inView(currentY - 0.02f, currentY + 0.02f)) {
-                glColor3f(0.7f, 0.85f, 0.7f);
-                drawText(AE_CONTENT_X, currentY, status, GLUT_BITMAP_HELVETICA_10);
-            }
-            currentY -= AE_STATUS_STEP;
-        }
-
         currentY -= AE_FILTER_GAP;
+    }
+
+    // Fixed page footer — not part of tool button chrome
+    if (pageBar) {
+        VideoFilter* pf = aePagedFilter();
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glColor4f(0.06f, 0.07f, 0.10f, 0.95f);
+        glBegin(GL_QUADS);
+        glVertex2f(AE_PANEL_X + 0.01f, AE_BOTTOM_LIMIT + 0.005f);
+        glVertex2f(AE_PANEL_X + AE_PANEL_W - 0.01f, AE_BOTTOM_LIMIT + 0.005f);
+        glVertex2f(AE_PANEL_X + AE_PANEL_W - 0.01f, AE_BOTTOM_LIMIT + AE_PAGE_BAR_H - 0.005f);
+        glVertex2f(AE_PANEL_X + 0.01f, AE_BOTTOM_LIMIT + AE_PAGE_BAR_H - 0.005f);
+        glEnd();
+        glColor4f(0.45f, 0.5f, 0.6f, 0.9f);
+        glBegin(GL_LINES);
+        glVertex2f(AE_PANEL_X + 0.02f, AE_BOTTOM_LIMIT + AE_PAGE_BAR_H - 0.005f);
+        glVertex2f(AE_PANEL_X + AE_PANEL_W - 0.02f, AE_BOTTOM_LIMIT + AE_PAGE_BAR_H - 0.005f);
+        glEnd();
+        glDisable(GL_BLEND);
+
+        if (pf) {
+            float midY = AE_BOTTOM_LIMIT + AE_PAGE_BAR_H * 0.38f;
+            glColor3f(0.7f, 0.75f, 0.9f);
+            drawText(AE_CONTENT_X, midY, "<", GLUT_BITMAP_HELVETICA_18);
+            std::string page = pf->optionPageName(pf->optionPage);
+            std::ostringstream label;
+            label << "page  " << page << "  (" << (pf->optionPage + 1)
+                  << "/" << pf->optionPageCount() << ")";
+            glColor3f(0.85f, 0.88f, 1.0f);
+            drawText(AE_CONTENT_X + 0.08f, midY + 0.005f, label.str(), GLUT_BITMAP_HELVETICA_12);
+            glColor3f(0.7f, 0.75f, 0.9f);
+            drawText(AE_CONTENT_X + 0.36f, midY, ">", GLUT_BITMAP_HELVETICA_18);
+        }
     }
 }
 
-// Returns true if a slider or tool button was hit.
+// Returns true if a slider, tool, or page control was hit.
 bool hitTestActiveEffectsSliders(float fx, float fy) {
     if (!anyFilterEnabled()) return false;
 
     clampAePanelScroll();
-    const float listY = AE_BOTTOM_LIMIT;
     if (fx < AE_PANEL_X || fx > AE_PANEL_X + AE_PANEL_W ||
-        fy < listY || fy > AE_TOP_Y) {
+        fy < AE_BOTTOM_LIMIT || fy > AE_TOP_Y) {
         return false;
     }
+
+    // Page footer hits (fixed)
+    if (aeNeedsPageBar() && fy >= AE_BOTTOM_LIMIT && fy <= AE_BOTTOM_LIMIT + AE_PAGE_BAR_H) {
+        VideoFilter* pf = aePagedFilter();
+        if (pf) {
+            int pages = pf->optionPageCount();
+            if (fx < AE_CONTENT_X + 0.07f) {
+                pf->optionPage = (pf->optionPage + pages - 1) % pages;
+                return true;
+            }
+            if (fx > AE_CONTENT_X + 0.34f) {
+                pf->optionPage = (pf->optionPage + 1) % pages;
+                return true;
+            }
+        }
+        return true;
+    }
+
+    const float listY = aeScrollBottom();
+    if (fy < listY) return true;
 
     float currentY = AE_TOP_Y - AE_TITLE_STEP + aePanelScroll;
     for (size_t i = 0; i < filters.size(); ++i) {
         if (!filters[i]->enabled) continue;
 
         currentY -= AE_NAME_STEP;
+        if (!filters[i]->statusLine().empty())
+            currentY -= AE_STATUS_STEP;
 
         auto trySlider = [&](int paramType, float& value) -> bool {
+            currentY -= AE_LABEL_STEP;
             float sy = currentY - AE_SLIDER_H;
             if (isInside(fx, fy, AE_CONTENT_X, sy, AE_SLIDER_W, AE_SLIDER_H)) {
                 activeSlider = static_cast<int>(i) * AE_SLIDER_STRIDE + paramType;
                 value = std::max(0.0f, std::min(1.0f, (fx - AE_CONTENT_X) / AE_SLIDER_W));
                 return true;
             }
-            currentY -= AE_SLIDER_STEP;
+            currentY -= (AE_SLIDER_H + AE_SLIDER_GAP);
             return false;
         };
 
-        if (filters[i]->hasStrength() && trySlider(0, filters[i]->strength)) return true;
-        if (filters[i]->hasParam1() && trySlider(1, filters[i]->param1)) return true;
-        if (filters[i]->hasParam2() && trySlider(2, filters[i]->param2)) return true;
-        if (filters[i]->hasParam3() && trySlider(3, filters[i]->param3)) return true;
-        if (filters[i]->hasParam4() && trySlider(4, filters[i]->param4)) return true;
-        if (filters[i]->hasParam5() && trySlider(5, filters[i]->param5)) return true;
-        if (filters[i]->hasParam6() && trySlider(6, filters[i]->param6)) return true;
-        if (filters[i]->hasParam7() && trySlider(7, filters[i]->param7)) return true;
-        if (filters[i]->hasParam8() && trySlider(8, filters[i]->param8)) return true;
-        if (filters[i]->hasParam9() && trySlider(9, filters[i]->param9)) return true;
-        if (filters[i]->hasParam10() && trySlider(10, filters[i]->param10)) return true;
-        if (filters[i]->hasParam11() && trySlider(11, filters[i]->param11)) return true;
-        if (filters[i]->hasParam12() && trySlider(12, filters[i]->param12)) return true;
-        if (filters[i]->hasParam13() && trySlider(13, filters[i]->param13)) return true;
-        if (filters[i]->hasParam14() && trySlider(14, filters[i]->param14)) return true;
-        if (filters[i]->hasParam15() && trySlider(15, filters[i]->param15)) return true;
+        if (aeShowsStrength(filters[i]) && trySlider(0, filters[i]->strength)) return true;
+        if (aeShowsParam(filters[i], 1) && trySlider(1, filters[i]->param1)) return true;
+        if (aeShowsParam(filters[i], 2) && trySlider(2, filters[i]->param2)) return true;
+        if (aeShowsParam(filters[i], 3) && trySlider(3, filters[i]->param3)) return true;
+        if (aeShowsParam(filters[i], 4) && trySlider(4, filters[i]->param4)) return true;
+        if (aeShowsParam(filters[i], 5) && trySlider(5, filters[i]->param5)) return true;
+        if (aeShowsParam(filters[i], 6) && trySlider(6, filters[i]->param6)) return true;
+        if (aeShowsParam(filters[i], 7) && trySlider(7, filters[i]->param7)) return true;
+        if (aeShowsParam(filters[i], 8) && trySlider(8, filters[i]->param8)) return true;
+        if (aeShowsParam(filters[i], 9) && trySlider(9, filters[i]->param9)) return true;
+        if (aeShowsParam(filters[i], 10) && trySlider(10, filters[i]->param10)) return true;
+        if (aeShowsParam(filters[i], 11) && trySlider(11, filters[i]->param11)) return true;
+        if (aeShowsParam(filters[i], 12) && trySlider(12, filters[i]->param12)) return true;
+        if (aeShowsParam(filters[i], 13) && trySlider(13, filters[i]->param13)) return true;
+        if (aeShowsParam(filters[i], 14) && trySlider(14, filters[i]->param14)) return true;
+        if (aeShowsParam(filters[i], 15) && trySlider(15, filters[i]->param15)) return true;
+        if (aeShowsParam(filters[i], 16) && trySlider(16, filters[i]->param16)) return true;
+        if (aeShowsParam(filters[i], 17) && trySlider(17, filters[i]->param17)) return true;
 
         int tools = filters[i]->toolButtonCount();
         if (tools > 0) {
+            currentY -= AE_TOOLS_PAD;
             const float btnW = (AE_SLIDER_W - AE_TOOL_GAP) * 0.5f;
             for (int t = 0; t < tools; ++t) {
                 int col = t % 2;
@@ -3438,12 +3671,9 @@ bool hitTestActiveEffectsSliders(float fx, float fy) {
             }
         }
 
-        if (!filters[i]->statusLine().empty())
-            currentY -= AE_STATUS_STEP;
-
         currentY -= AE_FILTER_GAP;
     }
-    return true; // absorb clicks on AE chrome
+    return true;
 }
 
 void drawSlider(float x, float y, float w, float h, float value, const std::string& label) {
@@ -3751,9 +3981,9 @@ void mouse(int button, int state, int x, int y) {
             fy >= AE_BOTTOM_LIMIT && fy <= AE_TOP_Y) {
             clampAePanelScroll();
             if (button == 3)
-                aePanelScroll = std::max(0.0f, aePanelScroll - AE_SLIDER_STEP);
+                aePanelScroll = std::max(0.0f, aePanelScroll - AE_PARAM_STEP);
             else
-                aePanelScroll += AE_SLIDER_STEP;
+                aePanelScroll += AE_PARAM_STEP;
             clampAePanelScroll();
             return;
         }
@@ -4023,6 +4253,8 @@ void mouseMotion(int x, int y) {
         case 13: filters[filterIdx]->param13 = normalizedValue; break;
         case 14: filters[filterIdx]->param14 = normalizedValue; break;
         case 15: filters[filterIdx]->param15 = normalizedValue; break;
+        case 16: filters[filterIdx]->param16 = normalizedValue; break;
+        case 17: filters[filterIdx]->param17 = normalizedValue; break;
     }
 
     glutPostRedisplay();
@@ -4165,6 +4397,8 @@ void keyboard(unsigned char key, int x, int y) {
                     case 13: filters[filterIdx]->param13 = std::max(0.0f, filters[filterIdx]->param13 - step); break;
                     case 14: filters[filterIdx]->param14 = std::max(0.0f, filters[filterIdx]->param14 - step); break;
                     case 15: filters[filterIdx]->param15 = std::max(0.0f, filters[filterIdx]->param15 - step); break;
+                    case 16: filters[filterIdx]->param16 = std::max(0.0f, filters[filterIdx]->param16 - step); break;
+                    case 17: filters[filterIdx]->param17 = std::max(0.0f, filters[filterIdx]->param17 - step); break;
                 }
             } else {
                 videoScale = std::max(VIDEO_SCALE_MIN, videoScale - 0.05f);
@@ -4193,6 +4427,8 @@ void keyboard(unsigned char key, int x, int y) {
                     case 13: filters[filterIdx]->param13 = std::min(1.0f, filters[filterIdx]->param13 + step); break;
                     case 14: filters[filterIdx]->param14 = std::min(1.0f, filters[filterIdx]->param14 + step); break;
                     case 15: filters[filterIdx]->param15 = std::min(1.0f, filters[filterIdx]->param15 + step); break;
+                    case 16: filters[filterIdx]->param16 = std::min(1.0f, filters[filterIdx]->param16 + step); break;
+                    case 17: filters[filterIdx]->param17 = std::min(1.0f, filters[filterIdx]->param17 + step); break;
                 }
             } else {
                 videoScale = std::min(VIDEO_SCALE_MAX, videoScale + 0.05f);
@@ -4998,36 +5234,25 @@ void displayControlWindow() {
         drawFormatPanel();
         drawActiveEffectsPanel();
 
-        drawText(-0.95f, 0.95f, "F Vid FS | H Ctl FS | V Open | Q Queue | C Cam | I Win");
+        drawText(-0.95f, 0.95f, "F/H FS | V Open | Q Queue | C Cam | I Win | AE: <Pg Pg>");
         {
             std::ostringstream perf;
-            perf << "Decode: " << hwDecodeStatus
-                 << " | OpenCL: " << (cv::ocl::useOpenCL() ? "on" : "off")
-                 << " | GL tex display";
+            perf << "Decode " << hwDecodeStatus
+                 << " | CL " << (cv::ocl::useOpenCL() ? "on" : "off");
+            if (formatAspectActive() || forceResActive()) {
+                perf << " | ";
+                if (formatAspectActive()) {
+                    if (formatUseCustom)
+                        perf << "asp " << std::fixed << std::setprecision(2) << currentFormatAspect();
+                    else if (formatPresetIndex >= 0)
+                        perf << kAspectFormats[formatPresetIndex].name;
+                }
+                if (forceResActive())
+                    perf << " " << forceResWidth() << "x" << forceResHeight();
+            }
+            if (windowCaptureActive && !captureWindowTitle.empty())
+                perf << " | " << truncateLabel(captureWindowTitle, 28);
             drawText(-0.95f, 0.90f, perf.str());
-        }
-        drawText(-0.95f, 0.85f, "Aspect/Res under Filters | Bord hides guide | Def=native res");
-        float statusY = 0.80f;
-        if (formatAspectActive() || forceResActive()) {
-            std::ostringstream fmt;
-            if (formatAspectActive()) {
-                std::string mode = formatMode == 0 ? "letter" : "crop";
-                if (formatUseCustom)
-                    fmt << "Aspect " << std::fixed << std::setprecision(2) << currentFormatAspect();
-                else if (formatPresetIndex >= 0)
-                    fmt << kAspectFormats[formatPresetIndex].name;
-                fmt << " (" << mode << ")";
-                if (!formatShowBorder) fmt << " no-bord";
-            }
-            if (forceResActive()) {
-                if (formatAspectActive()) fmt << " | ";
-                fmt << forceResWidth() << "x" << forceResHeight();
-            }
-            drawText(-0.95f, statusY, fmt.str());
-            statusY -= 0.05f;
-        }
-        if (windowCaptureActive && !captureWindowTitle.empty()) {
-            drawText(-0.95f, statusY, "Live: " + truncateLabel(captureWindowTitle, 70));
         }
     }
 
