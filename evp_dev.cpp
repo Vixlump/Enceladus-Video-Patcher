@@ -62,8 +62,8 @@ int controlSavedX = 920, controlSavedY = 80, controlSavedW = 960, controlSavedH 
 int windowWidth = 960, windowHeight = 720;
 float uiScale = 1.0f;
 int activeSlider = -1; // -1 means no slider is active
-// Encodes activeSlider as filterIdx * AE_SLIDER_STRIDE + paramType (0=strength .. 18=param18)
-const int AE_SLIDER_STRIDE = 19;
+// Encodes activeSlider as filterIdx * AE_SLIDER_STRIDE + paramType (0=strength .. 20=param20)
+const int AE_SLIDER_STRIDE = 21;
 float aePanelScroll = 0.0f; // scroll offset for tall Active Effects lists
 bool isSeeking = false;
 double videoDuration = 0;
@@ -286,9 +286,13 @@ public:
     virtual bool hasParam16() const { return false; }
     virtual bool hasParam17() const { return false; }
     virtual bool hasParam18() const { return false; }
+    virtual bool hasParam19() const { return false; }
+    virtual bool hasParam20() const { return false; }
     virtual std::string param16Name() const { return ""; }
     virtual std::string param17Name() const { return ""; }
     virtual std::string param18Name() const { return ""; }
+    virtual std::string param19Name() const { return ""; }
+    virtual std::string param20Name() const { return ""; }
     virtual bool hasReset() const { return false; }
     virtual void reset() {}
     // Optional calibration / tool buttons drawn under a filter's sliders
@@ -303,7 +307,7 @@ public:
     virtual int optionPageCount() const { return 1; }
     virtual std::string optionPageName(int /*i*/) const { return "Params"; }
     virtual bool showStrengthOnPage() const { return hasStrength(); }
-    virtual bool showParamOnPage(int /*paramIndex1to18*/) const { return true; }
+    virtual bool showParamOnPage(int /*paramIndex1to20*/) const { return true; }
     
     bool enabled = false;
     float strength = 1.0f;
@@ -325,6 +329,8 @@ public:
     float param16 = 0.55f;
     float param17 = 0.45f;
     float param18 = 0.85f;
+    float param19 = 0.35f;
+    float param20 = 0.85f;
     virtual ~VideoFilter() = default;
 };
 
@@ -906,23 +912,75 @@ class EnceladusVisionFilter : public VideoFilter {
             return;
         }
 
-        cv::Mat gray, blur, edges;
+        cv::Mat gray, edges;
         cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
-        cv::GaussianBlur(gray, blur, cv::Size(7, 7), 0);
 
-        // param13 = Edge Sense (kept conservative — high end still picky)
+        // param13 = Edge Sense: 0 = picky / strong only, 1 = fine / soft detail
         const float sense = std::max(0.0f, std::min(1.0f, param13));
-        const double cannyLo = 70.0 + (1.0 - sense) * 90.0;
-        const double cannyHi = 160.0 + (1.0 - sense) * 90.0;
+        // Bias the top of the slider toward finer detail without making mid too noisy
+        const float fine = sense * sense; // 0..1, aggressive near 1
+        cv::Mat blur;
+        const double sigma = (1.0 - sense) * 2.4 + (1.0 - fine) * 0.15; // ~2.55 .. ~0
+        if (sigma < 0.28) {
+            blur = gray; // no blur — keep hairline / micro edges
+        } else {
+            int blurK = std::max(3, static_cast<int>(std::lround(sigma * 3.0)) | 1);
+            if (blurK % 2 == 0) ++blurK;
+            cv::GaussianBlur(gray, blur, cv::Size(blurK, blurK), sigma);
+        }
+
+        // High Sense reaches very low Canny thresholds for faint / fine edges
+        const double cannyLo = 3.0 + (1.0 - sense) * 155.0 + (1.0 - fine) * 8.0;   // ~166 .. ~3
+        const double cannyHi = 12.0 + (1.0 - sense) * 210.0 + (1.0 - fine) * 20.0;  // ~242 .. ~12
         cv::Canny(blur, edges, cannyLo, cannyHi);
 
-        const int diag = std::max(frame.cols, frame.rows);
-        const double minLen = std::max(40.0, diag * (0.20 - sense * 0.07));
-        const int houghThresh = std::max(45, static_cast<int>(95 - sense * 35.0));
-        const double maxGap = 4.0 + sense * 10.0;
+        // Kill frame-border edges (video rectangle) before Hough
+        const int borderM = std::max(6, static_cast<int>(0.018f * std::min(frame.cols, frame.rows)));
+        if (edges.rows > borderM * 2 && edges.cols > borderM * 2) {
+            edges.rowRange(0, borderM).setTo(0);
+            edges.rowRange(edges.rows - borderM, edges.rows).setTo(0);
+            edges.colRange(0, borderM).setTo(0);
+            edges.colRange(edges.cols - borderM, edges.cols).setTo(0);
+        }
+
+        const float diag = static_cast<float>(std::sqrt(
+            static_cast<double>(frame.cols) * frame.cols + static_cast<double>(frame.rows) * frame.rows));
+        // param19 = Edge Min, param20 = Edge Max (fraction of frame diagonal)
+        float minT = std::max(0.0f, std::min(1.0f, param19));
+        float maxT = std::max(0.0f, std::min(1.0f, param20));
+        if (maxT < minT) std::swap(minT, maxT);
+        // High Sense also unlocks shorter segments (fine edges); Edge Min still sets the floor
+        const double minScale = 1.0 - sense * 0.55; // 1.0 .. 0.45
+        const double minLen = std::max(2.5, diag * (0.003 + minT * 0.40) * minScale);
+        const double maxLen = std::max(minLen + 6.0, diag * (0.08 + maxT * 0.95));
+        const int houghThresh = std::max(8, static_cast<int>(125.0f - sense * 110.0f - fine * 15.0f));
+        const double maxGap = 1.5 + sense * 22.0 + fine * 8.0;
 
         std::vector<cv::Vec4i> lines;
         cv::HoughLinesP(edges, lines, 1.0, CV_PI / 180.0, houghThresh, minLen, maxGap);
+
+        auto isFrameBorderSeg = [&](float x0, float y0, float x1, float y1) {
+            const float m = static_cast<float>(borderM) + 1.0f;
+            const float W = static_cast<float>(frame.cols - 1);
+            const float H = static_cast<float>(frame.rows - 1);
+            auto nearL = [&](float x) { return x <= m; };
+            auto nearR = [&](float x) { return x >= W - m; };
+            auto nearT = [&](float y) { return y <= m; };
+            auto nearB = [&](float y) { return y >= H - m; };
+            // Entire segment rides one frame side
+            if (nearL(x0) && nearL(x1)) return true;
+            if (nearR(x0) && nearR(x1)) return true;
+            if (nearT(y0) && nearT(y1)) return true;
+            if (nearB(y0) && nearB(y1)) return true;
+            // Long segment that stays inside a border strip (diagonal frame corners etc.)
+            float mx = 0.5f * (x0 + x1), my = 0.5f * (y0 + y1);
+            float dx = std::fabs(x1 - x0), dy = std::fabs(y1 - y0);
+            if (nearL(mx) && dy > dx * 1.2f) return true;
+            if (nearR(mx) && dy > dx * 1.2f) return true;
+            if (nearT(my) && dx > dy * 1.2f) return true;
+            if (nearB(my) && dx > dy * 1.2f) return true;
+            return false;
+        };
 
         struct Det { float x0, y0, x1, y1, nx, ny, len; };
         std::vector<Det> dets;
@@ -931,7 +989,8 @@ class EnceladusVisionFilter : public VideoFilter {
             float x1 = static_cast<float>(L[2]), y1 = static_cast<float>(L[3]);
             float dx = x1 - x0, dy = y1 - y0;
             float len = std::sqrt(dx * dx + dy * dy);
-            if (len < minLen * 0.9f) continue;
+            if (len < minLen * 0.9f || len > maxLen * 1.05f) continue;
+            if (isFrameBorderSeg(x0, y0, x1, y1)) continue;
             float inv = 1.0f / len;
             dets.push_back({x0, y0, x1, y1, -dy * inv, dx * inv, len});
         }
@@ -940,13 +999,13 @@ class EnceladusVisionFilter : public VideoFilter {
 
         // Dedup detections
         std::vector<Det> unique;
-        const int maxDet = 10;
+        const int maxDet = 8 + static_cast<int>(sense * 10.0f); // more candidates when hunting fine edges
         for (const auto& d : dets) {
             if (static_cast<int>(unique.size()) >= maxDet) break;
             bool dup = false;
             for (const auto& u : unique) {
                 if (segAlignScore(d.x0, d.y0, d.x1, d.y1, u.x0, u.y0, u.x1, u.y1,
-                                  static_cast<float>(diag)) > 0.78f) {
+                                  diag) > 0.78f) {
                     dup = true; break;
                 }
             }
@@ -961,7 +1020,7 @@ class EnceladusVisionFilter : public VideoFilter {
                 if (used[i]) continue;
                 float sc = segAlignScore(tr.x0, tr.y0, tr.x1, tr.y1,
                                          unique[i].x0, unique[i].y0, unique[i].x1, unique[i].y1,
-                                         static_cast<float>(diag));
+                                         diag);
                 if (sc > bestScore) { bestScore = sc; best = static_cast<int>(i); }
             }
             if (best >= 0) {
@@ -983,9 +1042,15 @@ class EnceladusVisionFilter : public VideoFilter {
                     float nlen = std::sqrt(tr.nx * tr.nx + tr.ny * tr.ny);
                     if (nlen > 1e-4f) { tr.nx /= nlen; tr.ny /= nlen; }
                 }
-                tr.age += 1;
-                tr.missed = 0;
-                used[best] = 1;
+                // Drop tracks that drifted onto the frame border
+                if (isFrameBorderSeg(tr.x0, tr.y0, tr.x1, tr.y1) ||
+                    tr.len < minLen * 0.85f || tr.len > maxLen * 1.1f) {
+                    tr.missed += 2;
+                } else {
+                    tr.age += 1;
+                    tr.missed = 0;
+                    used[best] = 1;
+                }
             } else {
                 tr.missed += 1;
             }
@@ -996,7 +1061,7 @@ class EnceladusVisionFilter : public VideoFilter {
         const float edgeAlpha = (edgeLerp <= 0.001f)
             ? 1.0f
             : (0.004f + std::pow(1.0f - edgeLerp, 2.6f) * 0.48f);
-        const int minEdgeAge = 8 + static_cast<int>((1.0f - sense) * 18.0f + edgeLerp * 20.0f);
+        const int minEdgeAge = 5 + static_cast<int>((1.0f - sense) * 16.0f + edgeLerp * 18.0f);
         const int maxEdgeMissed = 10 + static_cast<int>(edgeLerp * 28.0f);
 
         for (auto& tr : edgeTracks) {
@@ -1020,7 +1085,7 @@ class EnceladusVisionFilter : public VideoFilter {
 
         for (size_t i = 0; i < unique.size(); ++i) {
             if (used[i]) continue;
-            if (static_cast<int>(edgeTracks.size()) >= 8) break;
+            if (static_cast<int>(edgeTracks.size()) >= 8 + static_cast<int>(sense * 6.0f)) break;
             EdgeTrack t;
             t.x0 = unique[i].x0; t.y0 = unique[i].y0;
             t.x1 = unique[i].x1; t.y1 = unique[i].y1;
@@ -1577,12 +1642,14 @@ public:
         param10 = 0.55f; // Motion Point
         param11 = 0.55f; // Wave Lerp (higher = much longer ease)
         param12 = 0.45f; // Edge Strength
-        param13 = 0.22f; // Edge Sense (conservative)
+        param13 = 0.40f; // Edge Sense (0=picky, 1=soft)
         param14 = 0.55f; // Edge Lerp
         param15 = 0.40f; // Anticipate
         param16 = 0.55f; // Mot Strength
         param17 = 0.45f; // Mot Soft
         param18 = 0.85f; // Pop Strength
+        param19 = 0.30f; // Edge Min length
+        param20 = 0.80f; // Edge Max length
         anaglyphOn = true;
         popOn = true;
         edgeOn = true;
@@ -1632,6 +1699,8 @@ public:
     bool hasParam16() const override { return true; }
     bool hasParam17() const override { return true; }
     bool hasParam18() const override { return true; }
+    bool hasParam19() const override { return true; }
+    bool hasParam20() const override { return true; }
     std::string param1Name() const override { return "Strictness"; }
     std::string param2Name() const override { return "Wave Soft"; }
     std::string param3Name() const override { return "Wave Radius"; }
@@ -1650,6 +1719,8 @@ public:
     std::string param16Name() const override { return "Mot Strength"; }
     std::string param17Name() const override { return "Mot Soft"; }
     std::string param18Name() const override { return "Pop Strength"; }
+    std::string param19Name() const override { return "Edge Min"; }
+    std::string param20Name() const override { return "Edge Max"; }
     bool hasReset() const override { return true; }
 
     int optionPageCount() const override { return 5; }
@@ -1669,7 +1740,7 @@ public:
         switch (optionPage) {
             case 0: return n == 18 || n == 1 || n == 2 || n == 3 || n == 6 || n == 7 || n == 9 || n == 10;
             case 1: return n == 11 || n == 15;
-            case 2: return n == 12 || n == 13 || n == 14;
+            case 2: return n == 12 || n == 13 || n == 19 || n == 20 || n == 14;
             case 3: return n == 4 || n == 5 || n == 8;
             case 4: return n == 16 || n == 17;
             default: return true;
@@ -3493,6 +3564,7 @@ static bool aeShowsParam(const std::unique_ptr<VideoFilter>& f, int n) {
             case 13: return f->hasParam13(); case 14: return f->hasParam14();
             case 15: return f->hasParam15(); case 16: return f->hasParam16();
             case 17: return f->hasParam17(); case 18: return f->hasParam18();
+            case 19: return f->hasParam19(); case 20: return f->hasParam20();
             default: return false;
         }
     };
@@ -3526,7 +3598,7 @@ float activeEffectsContentHeight() {
         h += AE_NAME_STEP;
         if (!filter->statusLine().empty()) h += AE_STATUS_STEP;
         if (aeShowsStrength(filter)) h += AE_PARAM_STEP;
-        for (int p = 1; p <= 18; ++p)
+        for (int p = 1; p <= 20; ++p)
             if (aeShowsParam(filter, p)) h += AE_PARAM_STEP;
         int tools = filter->toolButtonCount();
         if (tools > 0) {
@@ -3656,6 +3728,8 @@ void drawActiveEffectsPanel() {
         if (aeShowsParam(filters[i], 11)) drawParam(filters[i]->param11, filters[i]->param11Name());
         if (aeShowsParam(filters[i], 12)) drawParam(filters[i]->param12, filters[i]->param12Name());
         if (aeShowsParam(filters[i], 13)) drawParam(filters[i]->param13, filters[i]->param13Name());
+        if (aeShowsParam(filters[i], 19)) drawParam(filters[i]->param19, filters[i]->param19Name());
+        if (aeShowsParam(filters[i], 20)) drawParam(filters[i]->param20, filters[i]->param20Name());
         if (aeShowsParam(filters[i], 14)) drawParam(filters[i]->param14, filters[i]->param14Name());
         if (aeShowsParam(filters[i], 15)) drawParam(filters[i]->param15, filters[i]->param15Name());
         if (aeShowsParam(filters[i], 16)) drawParam(filters[i]->param16, filters[i]->param16Name());
@@ -3782,6 +3856,8 @@ bool hitTestActiveEffectsSliders(float fx, float fy) {
         if (aeShowsParam(filters[i], 11) && trySlider(11, filters[i]->param11)) return true;
         if (aeShowsParam(filters[i], 12) && trySlider(12, filters[i]->param12)) return true;
         if (aeShowsParam(filters[i], 13) && trySlider(13, filters[i]->param13)) return true;
+        if (aeShowsParam(filters[i], 19) && trySlider(19, filters[i]->param19)) return true;
+        if (aeShowsParam(filters[i], 20) && trySlider(20, filters[i]->param20)) return true;
         if (aeShowsParam(filters[i], 14) && trySlider(14, filters[i]->param14)) return true;
         if (aeShowsParam(filters[i], 15) && trySlider(15, filters[i]->param15)) return true;
         if (aeShowsParam(filters[i], 16) && trySlider(16, filters[i]->param16)) return true;
@@ -4389,6 +4465,8 @@ void mouseMotion(int x, int y) {
         case 16: filters[filterIdx]->param16 = normalizedValue; break;
         case 17: filters[filterIdx]->param17 = normalizedValue; break;
         case 18: filters[filterIdx]->param18 = normalizedValue; break;
+        case 19: filters[filterIdx]->param19 = normalizedValue; break;
+        case 20: filters[filterIdx]->param20 = normalizedValue; break;
     }
 
     glutPostRedisplay();
@@ -4534,6 +4612,8 @@ void keyboard(unsigned char key, int x, int y) {
                     case 16: filters[filterIdx]->param16 = std::max(0.0f, filters[filterIdx]->param16 - step); break;
                     case 17: filters[filterIdx]->param17 = std::max(0.0f, filters[filterIdx]->param17 - step); break;
                     case 18: filters[filterIdx]->param18 = std::max(0.0f, filters[filterIdx]->param18 - step); break;
+                    case 19: filters[filterIdx]->param19 = std::max(0.0f, filters[filterIdx]->param19 - step); break;
+                    case 20: filters[filterIdx]->param20 = std::max(0.0f, filters[filterIdx]->param20 - step); break;
                 }
             } else {
                 videoScale = std::max(VIDEO_SCALE_MIN, videoScale - 0.05f);
@@ -4565,6 +4645,8 @@ void keyboard(unsigned char key, int x, int y) {
                     case 16: filters[filterIdx]->param16 = std::min(1.0f, filters[filterIdx]->param16 + step); break;
                     case 17: filters[filterIdx]->param17 = std::min(1.0f, filters[filterIdx]->param17 + step); break;
                     case 18: filters[filterIdx]->param18 = std::min(1.0f, filters[filterIdx]->param18 + step); break;
+                    case 19: filters[filterIdx]->param19 = std::min(1.0f, filters[filterIdx]->param19 + step); break;
+                    case 20: filters[filterIdx]->param20 = std::min(1.0f, filters[filterIdx]->param20 + step); break;
                 }
             } else {
                 videoScale = std::min(VIDEO_SCALE_MAX, videoScale + 0.05f);
