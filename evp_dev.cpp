@@ -2,6 +2,7 @@
 #include <opencv2/videoio.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/video.hpp>
+#include <opencv2/core/ocl.hpp>
 #include <GL/freeglut.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -34,6 +35,14 @@ bool isLooping = false;
 bool showUI = true;
 int currentVideoIndex = 0;
 std::vector<std::string> playlist;
+
+// Performance: HW decode (VAAPI/etc via FFmpeg) + OpenGL textured display
+bool useHwDecode = true;
+bool useOpenCL = true;
+std::string hwDecodeStatus = "n/a";
+GLuint videoTexId = 0;
+int videoTexW = 0;
+int videoTexH = 0;
 
 // Dual windows: video (stream only) + control panel
 int videoWindowId = 0;
@@ -2084,11 +2093,49 @@ bool openVideoSource(const std::string& source) {
                     [](unsigned char c) { return std::isdigit(c); });
     if (isCamera) {
         int index = std::stoi(source);
+        hwDecodeStatus = "camera";
         // Prefer V4L2 on Linux so "0" is not parsed as a GStreamer bin.
-        if (cap.open(index, cv::CAP_V4L2)) return true;
-        return cap.open(index, cv::CAP_ANY);
+        if (cap.open(index, cv::CAP_V4L2)) {
+            cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
+            return true;
+        }
+        if (cap.open(index, cv::CAP_ANY)) {
+            cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
+            return true;
+        }
+        return false;
     }
-    return cap.open(source);
+
+    cap.release();
+    if (useHwDecode) {
+        // OpenCV 4.5.2+: ask FFmpeg for any available HW decoder (VAAPI/MFX/…).
+        // Decoded frames are still delivered as cv::Mat in system memory for filters.
+        std::vector<int> params = {
+            static_cast<int>(cv::CAP_PROP_HW_ACCELERATION),
+            static_cast<int>(cv::VIDEO_ACCELERATION_ANY),
+            static_cast<int>(cv::CAP_PROP_HW_ACCELERATION_USE_OPENCL),
+            useOpenCL ? 1 : 0,
+        };
+        if (cap.open(source, cv::CAP_FFMPEG, params)) {
+            int accel = static_cast<int>(cap.get(cv::CAP_PROP_HW_ACCELERATION));
+            if (accel == cv::VIDEO_ACCELERATION_VAAPI) hwDecodeStatus = "vaapi";
+            else if (accel == cv::VIDEO_ACCELERATION_MFX) hwDecodeStatus = "mfx";
+            else if (accel == cv::VIDEO_ACCELERATION_D3D11) hwDecodeStatus = "d3d11";
+            else if (accel == cv::VIDEO_ACCELERATION_NONE) hwDecodeStatus = "sw-fallback";
+            else hwDecodeStatus = "hw-any";
+            cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
+            return true;
+        }
+        cap.release();
+    }
+
+    if (cap.open(source, cv::CAP_FFMPEG) || cap.open(source)) {
+        hwDecodeStatus = useHwDecode ? "software" : "software(--no-hw-decode)";
+        cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
+        return true;
+    }
+    hwDecodeStatus = "failed";
+    return false;
 }
 
 bool isVideoExtension(const std::string& ext) {
@@ -3876,11 +3923,13 @@ void displayVideoFrame(const cv::Mat& frame) {
         return;
     }
     if (rgb.empty() || rgb.cols < 1 || rgb.rows < 1) return;
+    if (!rgb.isContinuous())
+        rgb = rgb.clone();
 
     float frameAspect = static_cast<float>(rgb.cols) / static_cast<float>(rgb.rows);
     float windowAspect = static_cast<float>(videoWinW) / static_cast<float>(videoWinH);
 
-    // Fit-contain size, then apply user scale
+    // Fit-contain size, then apply user scale (GPU scales via textured quad)
     float fitW, fitH;
     if (frameAspect > windowAspect) {
         fitW = static_cast<float>(videoWinW);
@@ -3890,42 +3939,30 @@ void displayVideoFrame(const cv::Mat& frame) {
         fitW = fitH * frameAspect;
     }
 
-    int drawWidth = std::max(1, static_cast<int>(fitW * videoScale + 0.5f));
-    int drawHeight = std::max(1, static_cast<int>(fitH * videoScale + 0.5f));
-    // Cap allocation size to avoid huge temporaries while still allowing zoom via ROI clip
-    const int maxDim = std::max(videoWinW, videoWinH) * 4;
-    drawWidth = std::min(drawWidth, std::max(1, maxDim));
-    drawHeight = std::min(drawHeight, std::max(1, maxDim));
+    float drawWidth = std::max(1.0f, fitW * videoScale);
+    float drawHeight = std::max(1.0f, fitH * videoScale);
+    float offsetX = (static_cast<float>(videoWinW) - drawWidth) * 0.5f
+                  + videoOffsetX * static_cast<float>(videoWinW) * 0.5f;
+    float offsetY = (static_cast<float>(videoWinH) - drawHeight) * 0.5f
+                  + videoOffsetY * static_cast<float>(videoWinH) * 0.5f;
 
-    int offsetX = (videoWinW - drawWidth) / 2 + static_cast<int>(videoOffsetX * videoWinW * 0.5f);
-    int offsetY = (videoWinH - drawHeight) / 2 + static_cast<int>(videoOffsetY * videoWinH * 0.5f);
-
-    cv::Mat resized;
-    try {
-        cv::resize(rgb, resized, cv::Size(drawWidth, drawHeight), 0, 0, cv::INTER_LINEAR);
-    } catch (const cv::Exception&) {
-        return;
+    if (!videoTexId)
+        glGenTextures(1, &videoTexId);
+    glBindTexture(GL_TEXTURE_2D, videoTexId);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    if (videoTexW != rgb.cols || videoTexH != rgb.rows) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, rgb.cols, rgb.rows, 0,
+                     GL_RGB, GL_UNSIGNED_BYTE, rgb.data);
+        videoTexW = rgb.cols;
+        videoTexH = rgb.rows;
+    } else {
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, rgb.cols, rgb.rows,
+                        GL_RGB, GL_UNSIGNED_BYTE, rgb.data);
     }
-    if (resized.empty()) return;
-    if (!resized.isContinuous())
-        resized = resized.clone();
-
-    // Clip to the window so glDrawPixels never writes outside the framebuffer
-    int srcX = 0, srcY = 0;
-    int dstX = offsetX, dstY = offsetY;
-    int dstW = drawWidth, dstH = drawHeight;
-    if (dstX < 0) { srcX = -dstX; dstW += dstX; dstX = 0; }
-    if (dstY < 0) { srcY = -dstY; dstH += dstY; dstY = 0; }
-    if (dstX + dstW > videoWinW) dstW = videoWinW - dstX;
-    if (dstY + dstH > videoWinH) dstH = videoWinH - dstY;
-    if (dstW <= 0 || dstH <= 0) return;
-    if (srcX + dstW > resized.cols) dstW = resized.cols - srcX;
-    if (srcY + dstH > resized.rows) dstH = resized.rows - srcY;
-    if (dstW <= 0 || dstH <= 0) return;
-
-    cv::Mat roi = resized(cv::Rect(srcX, srcY, dstW, dstH));
-    if (!roi.isContinuous())
-        roi = roi.clone();
 
     glViewport(0, 0, videoWinW, videoWinH);
     glMatrixMode(GL_PROJECTION);
@@ -3934,13 +3971,19 @@ void displayVideoFrame(const cv::Mat& frame) {
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
 
-    glRasterPos2i(dstX, dstY);
-    GLboolean valid = GL_FALSE;
-    glGetBooleanv(GL_CURRENT_RASTER_POSITION_VALID, &valid);
-    if (valid) {
-        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-        glDrawPixels(dstW, dstH, GL_RGB, GL_UNSIGNED_BYTE, roi.data);
-    }
+    glDisable(GL_BLEND);
+    glEnable(GL_TEXTURE_2D);
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+    glColor3f(1.0f, 1.0f, 1.0f);
+    glBegin(GL_QUADS);
+    // Frame was vertically flipped for legacy glDrawPixels; tex v=0 is image bottom.
+    glTexCoord2f(0.0f, 0.0f); glVertex2f(offsetX, offsetY);
+    glTexCoord2f(1.0f, 0.0f); glVertex2f(offsetX + drawWidth, offsetY);
+    glTexCoord2f(1.0f, 1.0f); glVertex2f(offsetX + drawWidth, offsetY + drawHeight);
+    glTexCoord2f(0.0f, 1.0f); glVertex2f(offsetX, offsetY + drawHeight);
+    glEnd();
+    glDisable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, 0);
 
     // Reset for overlays (normalized -1..1)
     glMatrixMode(GL_PROJECTION);
@@ -4634,7 +4677,15 @@ void displayControlWindow() {
         drawActiveEffectsPanel();
 
         drawText(-0.95f, 0.95f, "F Vid FS | H Ctl FS | V Open | Q Queue | C Cam | I Win");
-        drawText(-0.95f, 0.90f, "Aspect/Res under Filters | Bord hides guide | Def=native res");
+        {
+            std::ostringstream perf;
+            perf << "Decode: " << hwDecodeStatus
+                 << " | OpenCL: " << (cv::ocl::useOpenCL() ? "on" : "off")
+                 << " | GL tex display";
+            drawText(-0.95f, 0.90f, perf.str());
+        }
+        drawText(-0.95f, 0.85f, "Aspect/Res under Filters | Bord hides guide | Def=native res");
+        float statusY = 0.80f;
         if (formatAspectActive() || forceResActive()) {
             std::ostringstream fmt;
             if (formatAspectActive()) {
@@ -4650,11 +4701,11 @@ void displayControlWindow() {
                 if (formatAspectActive()) fmt << " | ";
                 fmt << forceResWidth() << "x" << forceResHeight();
             }
-            drawText(-0.95f, 0.85f, fmt.str());
+            drawText(-0.95f, statusY, fmt.str());
+            statusY -= 0.05f;
         }
         if (windowCaptureActive && !captureWindowTitle.empty()) {
-            drawText(-0.95f, (formatAspectActive() || forceResActive()) ? 0.80f : 0.85f,
-                     "Live: " + truncateLabel(captureWindowTitle, 70));
+            drawText(-0.95f, statusY, "Live: " + truncateLabel(captureWindowTitle, 70));
         }
     }
 
@@ -4868,6 +4919,12 @@ int main(int argc, char** argv) {
             enabled.insert(arg.substr(9));
         else if (arg == "--no-ui")
             showUI = false;
+        else if (arg == "--no-hw-decode")
+            useHwDecode = false;
+        else if (arg == "--hw-decode")
+            useHwDecode = true;
+        else if (arg == "--no-opencl")
+            useOpenCL = false;
         else if (arg == "--fullscreen")
             videoFullscreen = true;
         else if (arg == "--control-fullscreen")
@@ -4948,12 +5005,22 @@ int main(int argc, char** argv) {
 
     if (playlist.empty()) playlist.push_back("0");
 
+    if (useOpenCL && cv::ocl::haveOpenCL()) {
+        cv::ocl::setUseOpenCL(true);
+    } else {
+        cv::ocl::setUseOpenCL(false);
+        useOpenCL = false;
+    }
+
     // Initialize video capture
     if (!openVideoSource(playlist[0])) {
         std::cerr << "Failed to open source." << std::endl;
         return -1;
     }
     currentVideoIndex = 0;
+    std::cerr << "Decode: " << hwDecodeStatus
+              << " | OpenCL: " << (cv::ocl::useOpenCL() ? "on" : "off")
+              << " | display: GL texture" << std::endl;
 
     // Get video duration
     {

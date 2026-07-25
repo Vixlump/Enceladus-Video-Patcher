@@ -17,7 +17,8 @@ The app runs as **two windows**:
 - Video-window placement (sliders, presets, mouse drag move/resize)
 - Theater calibration guides (crosshair, edge, thirds, grid, safe areas, aspect frames)
 - Scriptable geometry and guide flags via CLI
-- Playlist support and adjustable playback speed
+- Playlist / queue support (UI + CLI) and adjustable playback speed
+- Hardware-accelerated decode when available (VAAPI via OpenCV/FFmpeg) and OpenGL textured display
 
 ## Requirements
 
@@ -33,8 +34,16 @@ Primary OS: Ubuntu. Other platforms may work with matching dependencies.
 sudo apt-get install build-essential libopencv-dev freeglut3-dev
 ./compile.sh
 # or:
-g++ -std=c++17 -o Enceladus_Video_Patcher evp_dev.cpp \
-  `pkg-config --cflags --libs opencv4` -lGL -lGLU -lglut -O2
+g++ -std=c++17 -O3 -march=native -o Enceladus_Video_Patcher evp_dev.cpp \
+  `pkg-config --cflags --libs opencv4 x11` -lGL -lGLU -lglut
+```
+
+For hardware video decode (VAAPI), install drivers / tools:
+
+```bash
+sudo apt install vainfo intel-media-va-driver-non-free   # Intel
+# or: mesa-va-drivers (AMD/Intel open), nvidia-vaapi-driver (NVIDIA experimental)
+vainfo   # should list decode profiles
 ```
 
 If some videos will not play:
@@ -53,6 +62,18 @@ sudo apt install ubuntu-restricted-extras
 With no files, camera `0` is used. Multiple video paths (positional or after `--queue` / `--playlist`) form a **playback queue**; **Next** / **N** advances. Relative paths are resolved from the current working directory first, then from the application executable folder.
 
 **Open** (or **V**) starts the file browser in the **executable's directory** (**App** button returns there; **~** goes to `$HOME`). Use **Queue** mode to add several videos without closing the browser, or **Play** mode to open immediately. **Que** / **Q** opens the queue panel (jump, Rem, Clear).
+
+### Performance / hardware acceleration
+
+- **Decode:** file sources open with OpenCV FFmpeg HW accel (`VIDEO_ACCELERATION_ANY`, typically VAAPI). Status shows on the control panel (`Decode: vaapi|software|…`). Disable with `--no-hw-decode`.
+- **Display:** frames upload as an OpenGL texture; the GPU scales/positions (no CPU `resize` + `glDrawPixels`).
+- **OpenCL:** enabled when available for OpenCV ops that use it; disable with `--no-opencl`.
+- **Filters** (EnceladusVision, Motion Pop, etc.) still run on the CPU — for heavy FX, lower Capture Scale / force a smaller output res (720/1080).
+
+```bash
+./Enceladus_Video_Patcher movie.mp4          # HW decode on by default
+./Enceladus_Video_Patcher --no-hw-decode movie.mp4
+```
 
 ### Dual windows
 
