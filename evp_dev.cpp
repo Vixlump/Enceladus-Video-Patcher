@@ -112,8 +112,8 @@ const float GUIDE_PANEL_Y = 0.58f;
 const float PLACE_PANEL_X = -0.45f;
 const float PLACE_PANEL_Y = 0.10f;
 const float FORMAT_PANEL_X = 0.48f;
-const float FORMAT_PANEL_Y = 0.06f;
-const float FORMAT_PANEL_H = 0.54f;
+const float FORMAT_PANEL_Y = 0.14f;
+const float FORMAT_PANEL_H = 0.66f;
 const float CAP_PANEL_X = -0.45f;
 const float CAP_PANEL_Y = 0.92f;
 
@@ -145,9 +145,34 @@ static const AspectFormat kAspectFormats[] = {
 };
 static const int kAspectFormatCount = static_cast<int>(sizeof(kAspectFormats) / sizeof(kAspectFormats[0]));
 int formatPresetIndex = -1; // -1 = native (off)
+bool formatUseCustom = false; // true when Aspect slider overrides preset
 int formatMode = 1;         // 0 = letterbox/pillarbox, 1 = center crop
+bool formatShowBorder = true; // gold aspect guide on video window
 int formatListScroll = 0;
-const int FORMAT_LIST_ROWS = 6;
+const int FORMAT_LIST_ROWS = 4;
+const float FORMAT_ASPECT_MIN = 0.40f;
+const float FORMAT_ASPECT_MAX = 3.60f;
+float formatAspectNorm = (16.0f / 9.0f - FORMAT_ASPECT_MIN) / (FORMAT_ASPECT_MAX - FORMAT_ASPECT_MIN);
+int activeFormatSlider = -1; // 0=aspect, 1=forceW, 2=forceH
+
+// Forced output resolution (-1 = source/default, -2 = custom W/H, else preset index)
+struct ForceResPreset {
+    const char* name;
+    int w;
+    int h;
+};
+static const ForceResPreset kForceResPresets[] = {
+    {"480p", 854, 480},
+    {"720p", 1280, 720},
+    {"1080p", 1920, 1080},
+    {"1440p", 2560, 1440},
+    {"4K", 3840, 2160},
+    {"1K sq", 1080, 1080},
+};
+static const int kForceResCount = static_cast<int>(sizeof(kForceResPresets) / sizeof(kForceResPresets[0]));
+int forceResPreset = -1; // -1 default, -2 custom, >=0 preset
+float forceResWNorm = (1920.0f - 320.0f) / (3840.0f - 320.0f);
+float forceResHNorm = (1080.0f - 240.0f) / (2160.0f - 240.0f);
 
 // Window-capture tuning (normalized crop fractions + performance)
 float capCropL = 0.0f;
@@ -193,7 +218,7 @@ const float FILT_PANEL_X = 0.48f;
 const float FILT_PANEL_W = 0.48f;
 const float FILT_PANEL_TOP = 0.82f;
 // Leave room under Filters for Aspect Formats (above view/transport).
-const float FILT_PANEL_BOTTOM = 0.12f;
+const float FILT_PANEL_BOTTOM = 0.20f;
 const float FILT_ROW_H = 0.072f;
 const float FILT_BTN_H = 0.055f;
 
@@ -1899,10 +1924,57 @@ cv::Mat applyCaptureTune(const cv::Mat& frame) {
     return out;
 }
 
+float formatAspectFromNorm(float n) {
+    n = std::max(0.0f, std::min(1.0f, n));
+    return FORMAT_ASPECT_MIN + n * (FORMAT_ASPECT_MAX - FORMAT_ASPECT_MIN);
+}
+
+float formatNormFromAspect(float aspect) {
+    float n = (aspect - FORMAT_ASPECT_MIN) / (FORMAT_ASPECT_MAX - FORMAT_ASPECT_MIN);
+    return std::max(0.0f, std::min(1.0f, n));
+}
+
+bool formatAspectActive() {
+    return formatUseCustom || (formatPresetIndex >= 0 && formatPresetIndex < kAspectFormatCount);
+}
+
+float currentFormatAspect() {
+    if (formatUseCustom)
+        return formatAspectFromNorm(formatAspectNorm);
+    if (formatPresetIndex >= 0 && formatPresetIndex < kAspectFormatCount)
+        return kAspectFormats[formatPresetIndex].aspect;
+    return formatAspectFromNorm(formatAspectNorm);
+}
+
+void syncFormatAspectNormFromPreset() {
+    if (formatPresetIndex >= 0 && formatPresetIndex < kAspectFormatCount)
+        formatAspectNorm = formatNormFromAspect(kAspectFormats[formatPresetIndex].aspect);
+}
+
+int forceResWidth() {
+    if (forceResPreset >= 0 && forceResPreset < kForceResCount)
+        return kForceResPresets[forceResPreset].w;
+    if (forceResPreset == -2)
+        return 320 + static_cast<int>(std::lround(std::max(0.0f, std::min(1.0f, forceResWNorm)) * (3840 - 320)));
+    return 0;
+}
+
+int forceResHeight() {
+    if (forceResPreset >= 0 && forceResPreset < kForceResCount)
+        return kForceResPresets[forceResPreset].h;
+    if (forceResPreset == -2)
+        return 240 + static_cast<int>(std::lround(std::max(0.0f, std::min(1.0f, forceResHNorm)) * (2160 - 240)));
+    return 0;
+}
+
+bool forceResActive() {
+    return forceResPreset == -2 || (forceResPreset >= 0 && forceResPreset < kForceResCount);
+}
+
 cv::Mat applyFormatAspect(const cv::Mat& frame) {
-    if (frame.empty() || formatPresetIndex < 0 || formatPresetIndex >= kAspectFormatCount)
+    if (frame.empty() || !formatAspectActive())
         return frame;
-    const float target = kAspectFormats[formatPresetIndex].aspect;
+    const float target = currentFormatAspect();
     if (target < 0.05f) return frame;
     const float src = static_cast<float>(frame.cols) / std::max(1, frame.rows);
     if (std::fabs(src - target) < 0.008f) return frame;
@@ -1934,6 +2006,19 @@ cv::Mat applyFormatAspect(const cv::Mat& frame) {
     int newH = std::max(2, static_cast<int>(std::lround(frame.cols / target)));
     int y0 = (frame.rows - newH) / 2;
     return frame(cv::Rect(0, y0, frame.cols, newH)).clone();
+}
+
+cv::Mat applyForcedResolution(const cv::Mat& frame) {
+    if (frame.empty() || !forceResActive())
+        return frame;
+    int tw = std::max(2, forceResWidth());
+    int th = std::max(2, forceResHeight());
+    if (frame.cols == tw && frame.rows == th)
+        return frame;
+    cv::Mat out;
+    int interp = (tw < frame.cols || th < frame.rows) ? cv::INTER_AREA : cv::INTER_LINEAR;
+    cv::resize(frame, out, cv::Size(tw, th), 0, 0, interp);
+    return out;
 }
 
 std::string makeWindowSourceId(const CaptureWindow& w) {
@@ -3254,6 +3339,7 @@ void mouse(int button, int state, int x, int y) {
             activeViewSlider = -1;
             activePlaceSlider = -1;
             activeCapSlider = -1;
+            activeFormatSlider = -1;
             isSeeking = false;
         }
     }
@@ -3285,6 +3371,23 @@ void mouseMotion(int x, int y) {
             case 3: capCropB = std::min(0.45f, norm); break;
             case 4: capDownscale = std::max(0.25f, norm); break;
             case 5: capFpsNorm = norm; break;
+        }
+        glutPostRedisplay();
+        return;
+    }
+
+    if (activeFormatSlider >= 0 && mouseLeftDown) {
+        const float panelW = FILT_PANEL_W;
+        if (activeFormatSlider == 0) {
+            formatAspectNorm = std::max(0.0f, std::min(1.0f,
+                (fx - (FORMAT_PANEL_X + 0.02f)) / (panelW - 0.04f)));
+            formatUseCustom = true;
+        } else if (activeFormatSlider == 1) {
+            forceResWNorm = std::max(0.0f, std::min(1.0f, (fx - (FORMAT_PANEL_X + 0.02f)) / 0.20f));
+            forceResPreset = -2;
+        } else if (activeFormatSlider == 2) {
+            forceResHNorm = std::max(0.0f, std::min(1.0f, (fx - (FORMAT_PANEL_X + 0.24f)) / 0.20f));
+            forceResPreset = -2;
         }
         glutPostRedisplay();
         return;
@@ -3781,7 +3884,7 @@ void drawCalibrationGuides() {
     bool any = guideCrosshair || guideEdgeBorder || guideThirds || guideGrid ||
                guideActionSafe || guideTitleSafe || guideAspect169 ||
                guideAspect43 || guideAspect239 ||
-               (formatPresetIndex >= 0 && formatPresetIndex < kAspectFormatCount);
+               (formatShowBorder && formatAspectActive());
     if (!any) return;
 
     glEnable(GL_BLEND);
@@ -3830,10 +3933,10 @@ void drawCalibrationGuides() {
         glColor4f(1.0f, 0.5f, 0.9f, 0.9f);
         drawAspectGuide(2.39f);
     }
-    if (formatPresetIndex >= 0 && formatPresetIndex < kAspectFormatCount) {
+    if (formatShowBorder && formatAspectActive()) {
         glColor4f(1.0f, 0.85f, 0.35f, 0.95f);
         glLineWidth(2.0f);
-        drawAspectGuide(kAspectFormats[formatPresetIndex].aspect);
+        drawAspectGuide(currentFormatAspect());
         glLineWidth(1.0f);
     }
 
@@ -3907,6 +4010,7 @@ void processCaptureFrame() {
     for (auto& filter : filters)
         frame = filter->apply(frame);
     frame = applyFormatAspect(frame);
+    frame = applyForcedResolution(frame);
     cv::flip(frame, frame, 0);
     latestFrame = frame;
 }
@@ -4079,28 +4183,60 @@ void drawFormatPanel() {
     glDisable(GL_BLEND);
 
     glColor3f(1, 1, 1);
-    drawText(FORMAT_PANEL_X + 0.02f, FORMAT_PANEL_Y + 0.01f, "Aspect Formats", GLUT_BITMAP_HELVETICA_12);
+    drawText(FORMAT_PANEL_X + 0.02f, FORMAT_PANEL_Y + 0.01f, "Aspect / Resolution", GLUT_BITMAP_HELVETICA_12);
 
-    drawButton(FORMAT_PANEL_X + 0.02f, FORMAT_PANEL_Y - 0.05f, 0.10f, 0.042f, "Off", false, formatPresetIndex < 0);
-    drawButton(FORMAT_PANEL_X + 0.13f, FORMAT_PANEL_Y - 0.05f, 0.11f, 0.042f, "Crop", false, formatMode == 1);
-    drawButton(FORMAT_PANEL_X + 0.25f, FORMAT_PANEL_Y - 0.05f, 0.12f, 0.042f, "Letter", false, formatMode == 0);
-    drawButton(FORMAT_PANEL_X + 0.38f, FORMAT_PANEL_Y - 0.05f, 0.08f, 0.042f, "Up");
+    drawButton(FORMAT_PANEL_X + 0.02f, FORMAT_PANEL_Y - 0.05f, 0.08f, 0.040f, "Off", false, !formatAspectActive());
+    drawButton(FORMAT_PANEL_X + 0.11f, FORMAT_PANEL_Y - 0.05f, 0.09f, 0.040f, "Crop", false, formatMode == 1);
+    drawButton(FORMAT_PANEL_X + 0.21f, FORMAT_PANEL_Y - 0.05f, 0.10f, 0.040f, "Letter", false, formatMode == 0);
+    drawButton(FORMAT_PANEL_X + 0.32f, FORMAT_PANEL_Y - 0.05f, 0.07f, 0.040f, "Bord", false, formatShowBorder);
+    drawButton(FORMAT_PANEL_X + 0.40f, FORMAT_PANEL_Y - 0.05f, 0.06f, 0.040f, "Up");
 
     formatListScroll = std::max(0, std::min(formatListScroll,
         std::max(0, kAspectFormatCount - FORMAT_LIST_ROWS)));
 
-    const float rowH = 0.055f;
-    const float listTop = FORMAT_PANEL_Y - 0.11f;
+    const float rowH = 0.048f;
+    const float listTop = FORMAT_PANEL_Y - 0.10f;
     for (int i = 0; i < FORMAT_LIST_ROWS; ++i) {
         int idx = formatListScroll + i;
         if (idx >= kAspectFormatCount) break;
         float y = listTop - i * rowH;
-        bool on = (idx == formatPresetIndex);
-        drawButton(FORMAT_PANEL_X + 0.02f, y - 0.04f, panelW - 0.04f, 0.048f,
+        bool on = (!formatUseCustom && idx == formatPresetIndex);
+        drawButton(FORMAT_PANEL_X + 0.02f, y - 0.036f, panelW - 0.04f, 0.040f,
                    kAspectFormats[idx].name, false, on);
     }
-    drawButton(FORMAT_PANEL_X + 0.02f, FORMAT_PANEL_Y - panelH + 0.02f, 0.21f, 0.042f, "Prev");
-    drawButton(FORMAT_PANEL_X + 0.25f, FORMAT_PANEL_Y - panelH + 0.02f, 0.21f, 0.042f, "Next");
+
+    const float sliderY = FORMAT_PANEL_Y - 0.32f;
+    drawSlider(FORMAT_PANEL_X + 0.02f, sliderY, panelW - 0.04f, 0.018f, formatAspectNorm, "Aspect");
+    char aspectBuf[48];
+    std::snprintf(aspectBuf, sizeof(aspectBuf), "%.2f%s", currentFormatAspect(),
+                  formatUseCustom ? " custom" : (formatAspectActive() ? "" : " (off)"));
+    glColor3f(0.75f, 0.85f, 1.0f);
+    drawText(FORMAT_PANEL_X + 0.02f, sliderY - 0.035f, aspectBuf, GLUT_BITMAP_HELVETICA_10);
+
+    const float resY = FORMAT_PANEL_Y - 0.42f;
+    drawButton(FORMAT_PANEL_X + 0.02f, resY, 0.07f, 0.038f, "Def", false, forceResPreset == -1);
+    drawButton(FORMAT_PANEL_X + 0.10f, resY, 0.07f, 0.038f, "720", false, forceResPreset == 1);
+    drawButton(FORMAT_PANEL_X + 0.18f, resY, 0.08f, 0.038f, "1080", false, forceResPreset == 2);
+    drawButton(FORMAT_PANEL_X + 0.27f, resY, 0.08f, 0.038f, "1440", false, forceResPreset == 3);
+    drawButton(FORMAT_PANEL_X + 0.36f, resY, 0.06f, 0.038f, "4K", false, forceResPreset == 4);
+    drawButton(FORMAT_PANEL_X + 0.02f, resY - 0.05f, 0.07f, 0.038f, "480", false, forceResPreset == 0);
+    drawButton(FORMAT_PANEL_X + 0.10f, resY - 0.05f, 0.08f, 0.038f, "Sq1K", false, forceResPreset == 5);
+    drawButton(FORMAT_PANEL_X + 0.19f, resY - 0.05f, 0.10f, 0.038f, "Custom", false, forceResPreset == -2);
+
+    drawSlider(FORMAT_PANEL_X + 0.02f, resY - 0.12f, 0.20f, 0.018f, forceResWNorm, "Res W");
+    drawSlider(FORMAT_PANEL_X + 0.24f, resY - 0.12f, 0.20f, 0.018f, forceResHNorm, "Res H");
+
+    char resBuf[64];
+    if (forceResActive()) {
+        std::snprintf(resBuf, sizeof(resBuf), "Out %dx%d", forceResWidth(), forceResHeight());
+    } else {
+        std::snprintf(resBuf, sizeof(resBuf), "Out default");
+    }
+    glColor3f(0.75f, 0.85f, 1.0f);
+    drawText(FORMAT_PANEL_X + 0.02f, resY - 0.16f, resBuf, GLUT_BITMAP_HELVETICA_10);
+
+    drawButton(FORMAT_PANEL_X + 0.02f, FORMAT_PANEL_Y - panelH + 0.02f, 0.21f, 0.040f, "Prev");
+    drawButton(FORMAT_PANEL_X + 0.25f, FORMAT_PANEL_Y - panelH + 0.02f, 0.21f, 0.040f, "Next");
 }
 
 bool hitTestFormatPanel(float fx, float fy) {
@@ -4110,39 +4246,78 @@ bool hitTestFormatPanel(float fx, float fy) {
         fy < FORMAT_PANEL_Y - panelH || fy > FORMAT_PANEL_Y + 0.04f)
         return false;
 
-    if (isInside(fx, fy, FORMAT_PANEL_X + 0.02f, FORMAT_PANEL_Y - 0.05f, 0.10f, 0.042f)) {
+    if (isInside(fx, fy, FORMAT_PANEL_X + 0.02f, FORMAT_PANEL_Y - 0.05f, 0.08f, 0.040f)) {
         formatPresetIndex = -1;
+        formatUseCustom = false;
         return true;
     }
-    if (isInside(fx, fy, FORMAT_PANEL_X + 0.13f, FORMAT_PANEL_Y - 0.05f, 0.11f, 0.042f)) {
+    if (isInside(fx, fy, FORMAT_PANEL_X + 0.11f, FORMAT_PANEL_Y - 0.05f, 0.09f, 0.040f)) {
         formatMode = 1;
         return true;
     }
-    if (isInside(fx, fy, FORMAT_PANEL_X + 0.25f, FORMAT_PANEL_Y - 0.05f, 0.12f, 0.042f)) {
+    if (isInside(fx, fy, FORMAT_PANEL_X + 0.21f, FORMAT_PANEL_Y - 0.05f, 0.10f, 0.040f)) {
         formatMode = 0;
         return true;
     }
-    if (isInside(fx, fy, FORMAT_PANEL_X + 0.38f, FORMAT_PANEL_Y - 0.05f, 0.08f, 0.042f)) {
+    if (isInside(fx, fy, FORMAT_PANEL_X + 0.32f, FORMAT_PANEL_Y - 0.05f, 0.07f, 0.040f)) {
+        formatShowBorder = !formatShowBorder;
+        return true;
+    }
+    if (isInside(fx, fy, FORMAT_PANEL_X + 0.40f, FORMAT_PANEL_Y - 0.05f, 0.06f, 0.040f)) {
         formatListScroll = std::max(0, formatListScroll - FORMAT_LIST_ROWS);
         return true;
     }
 
-    const float rowH = 0.055f;
-    const float listTop = FORMAT_PANEL_Y - 0.11f;
+    const float rowH = 0.048f;
+    const float listTop = FORMAT_PANEL_Y - 0.10f;
     for (int i = 0; i < FORMAT_LIST_ROWS; ++i) {
         int idx = formatListScroll + i;
         if (idx >= kAspectFormatCount) break;
         float y = listTop - i * rowH;
-        if (isInside(fx, fy, FORMAT_PANEL_X + 0.02f, y - 0.04f, panelW - 0.04f, 0.048f)) {
+        if (isInside(fx, fy, FORMAT_PANEL_X + 0.02f, y - 0.036f, panelW - 0.04f, 0.040f)) {
             formatPresetIndex = idx;
+            formatUseCustom = false;
+            syncFormatAspectNormFromPreset();
             return true;
         }
     }
-    if (isInside(fx, fy, FORMAT_PANEL_X + 0.02f, FORMAT_PANEL_Y - panelH + 0.02f, 0.21f, 0.042f)) {
+
+    const float sliderY = FORMAT_PANEL_Y - 0.32f;
+    if (isInside(fx, fy, FORMAT_PANEL_X + 0.02f, sliderY, panelW - 0.04f, 0.018f)) {
+        activeFormatSlider = 0;
+        formatAspectNorm = std::max(0.0f, std::min(1.0f, (fx - (FORMAT_PANEL_X + 0.02f)) / (panelW - 0.04f)));
+        formatUseCustom = true;
+        return true;
+    }
+
+    const float resY = FORMAT_PANEL_Y - 0.42f;
+    if (isInside(fx, fy, FORMAT_PANEL_X + 0.02f, resY, 0.07f, 0.038f)) { forceResPreset = -1; return true; }
+    if (isInside(fx, fy, FORMAT_PANEL_X + 0.10f, resY, 0.07f, 0.038f)) { forceResPreset = 1; return true; }
+    if (isInside(fx, fy, FORMAT_PANEL_X + 0.18f, resY, 0.08f, 0.038f)) { forceResPreset = 2; return true; }
+    if (isInside(fx, fy, FORMAT_PANEL_X + 0.27f, resY, 0.08f, 0.038f)) { forceResPreset = 3; return true; }
+    if (isInside(fx, fy, FORMAT_PANEL_X + 0.36f, resY, 0.06f, 0.038f)) { forceResPreset = 4; return true; }
+    if (isInside(fx, fy, FORMAT_PANEL_X + 0.02f, resY - 0.05f, 0.07f, 0.038f)) { forceResPreset = 0; return true; }
+    if (isInside(fx, fy, FORMAT_PANEL_X + 0.10f, resY - 0.05f, 0.08f, 0.038f)) { forceResPreset = 5; return true; }
+    if (isInside(fx, fy, FORMAT_PANEL_X + 0.19f, resY - 0.05f, 0.10f, 0.038f)) { forceResPreset = -2; return true; }
+
+    if (isInside(fx, fy, FORMAT_PANEL_X + 0.02f, resY - 0.12f, 0.20f, 0.018f)) {
+        activeFormatSlider = 1;
+        forceResWNorm = std::max(0.0f, std::min(1.0f, (fx - (FORMAT_PANEL_X + 0.02f)) / 0.20f));
+        forceResPreset = -2;
+        return true;
+    }
+    if (isInside(fx, fy, FORMAT_PANEL_X + 0.24f, resY - 0.12f, 0.20f, 0.018f)) {
+        activeFormatSlider = 2;
+        forceResHNorm = std::max(0.0f, std::min(1.0f, (fx - (FORMAT_PANEL_X + 0.24f)) / 0.20f));
+        forceResPreset = -2;
+        return true;
+    }
+
+    if (isInside(fx, fy, FORMAT_PANEL_X + 0.02f, FORMAT_PANEL_Y - panelH + 0.02f, 0.21f, 0.040f)) {
         formatListScroll = std::max(0, formatListScroll - FORMAT_LIST_ROWS);
         return true;
     }
-    if (isInside(fx, fy, FORMAT_PANEL_X + 0.25f, FORMAT_PANEL_Y - panelH + 0.02f, 0.21f, 0.042f)) {
+    if (isInside(fx, fy, FORMAT_PANEL_X + 0.25f, FORMAT_PANEL_Y - panelH + 0.02f, 0.21f, 0.040f)) {
         int maxScroll = std::max(0, kAspectFormatCount - FORMAT_LIST_ROWS);
         formatListScroll = std::min(maxScroll, formatListScroll + FORMAT_LIST_ROWS);
         return true;
@@ -4255,14 +4430,26 @@ void displayControlWindow() {
         drawActiveEffectsPanel();
 
         drawText(-0.95f, 0.95f, "F Vid FS | H Ctl FS | V Open | C Cam | I Win capture");
-        drawText(-0.95f, 0.90f, "Formats under Filters (right) | Capture tune when Win live");
-        if (formatPresetIndex >= 0 && formatPresetIndex < kAspectFormatCount) {
-            std::string mode = formatMode == 0 ? "letter" : "crop";
-            drawText(-0.95f, 0.85f, std::string("Format: ") + kAspectFormats[formatPresetIndex].name +
-                     " (" + mode + ")");
+        drawText(-0.95f, 0.90f, "Aspect/Res under Filters | Bord hides guide | Def=native res");
+        if (formatAspectActive() || forceResActive()) {
+            std::ostringstream fmt;
+            if (formatAspectActive()) {
+                std::string mode = formatMode == 0 ? "letter" : "crop";
+                if (formatUseCustom)
+                    fmt << "Aspect " << std::fixed << std::setprecision(2) << currentFormatAspect();
+                else if (formatPresetIndex >= 0)
+                    fmt << kAspectFormats[formatPresetIndex].name;
+                fmt << " (" << mode << ")";
+                if (!formatShowBorder) fmt << " no-bord";
+            }
+            if (forceResActive()) {
+                if (formatAspectActive()) fmt << " | ";
+                fmt << forceResWidth() << "x" << forceResHeight();
+            }
+            drawText(-0.95f, 0.85f, fmt.str());
         }
         if (windowCaptureActive && !captureWindowTitle.empty()) {
-            drawText(-0.95f, formatPresetIndex >= 0 ? 0.80f : 0.85f,
+            drawText(-0.95f, (formatAspectActive() || forceResActive()) ? 0.80f : 0.85f,
                      "Live: " + truncateLabel(captureWindowTitle, 70));
         }
     }

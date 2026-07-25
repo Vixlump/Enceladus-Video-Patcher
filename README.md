@@ -148,7 +148,10 @@ Calibration tools: Reset, Front, Ana ON/OFF, Tracks / Motion / Height overlays, 
 
 ### Aspect format presets
 
-**Aspect Formats** panel (right column, under Filters): pick cinema/delivery ratios and apply as **Crop** (center-cut) or **Letter** (pad bars). **Off** restores native aspect. Active format also draws a gold guide on the video window.
+**Aspect Formats** panel (right column, under Filters): pick cinema/delivery ratios and apply as **Crop** (center-cut) or **Letter** (pad bars). **Off** restores native aspect. **Bord** toggles the gold aspect guide line on the video window.
+
+- **Aspect** slider: continuous custom ratio (~0.40–3.60); dragging switches to custom.
+- **Resolution force:** **Def** (source/default), **480 / 720 / 1080 / 1440 / 4K / Sq1K**, or **Custom** with **Res W / Res H** sliders (about 320–3840 × 240–2160). Forced size is applied after aspect.
 
 Presets include: 1:1, 5:4, 4:3, 3:2, 16:10, 16:9, 1.85 Flat, **1.90 IMAX Digital**, 2:1, 21:9, 2.20 70mm, 2.35/2.39/2.40 Scope, 2.76 Ultra Panavision, **1.43 IMAX GT**, 4:5, 9:16, 32:9.
 
