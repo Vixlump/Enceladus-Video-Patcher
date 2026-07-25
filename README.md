@@ -125,11 +125,11 @@ Filter enable flags: `anaglyph`, `anaglyphseq`, `motionpop`, `enceladusvision` (
 
 **Motion Pop 3D** (`--enable-motionpop`): tracks large moving regions over time and only pops objects that stay on screen long enough (~0.5–1.5s) and cover a meaningful part of the frame. Brief flicker / small motion is ignored. Sliders: Strictness (higher = fewer / harder-to-qualify pops), Pop Scale.
 
-**EnceladusVision** (`--enable-enceladusvision` / `--enable-wavepop`): soft raised-cosine wave extrusion on tracked regions (not hard boxes). Default view keeps video in-frame; orbit to inspect 3D. **Ana ON/OFF** toggles anaglyph; **Ana Amount** sets disparity when on. **Wave Lerp** eases waves in/out (0 = instant jump).
+**EnceladusVision** (`--enable-enceladusvision` / `--enable-wavepop`): soft raised-cosine wave extrusion on tracked regions (not hard boxes). Default view keeps video in-frame; orbit to inspect 3D. **Ana ON/OFF** toggles anaglyph; **Ana Amount** sets disparity when on. **Wave Lerp** eases waves in/out over many frames (high end is very slow). **Anticipate** starts the pop earlier and rises faster / falls slower. **Edge Split** tracks straight-ish lines over time and only tears once they persist; **Edge Sense** (conservative), **Edge Lerp** eases the tear. **Edges** tool overlays tracked lines (bright = live).
 
-Sliders: Strength, Strictness, Wave Soft, Wave Radius, Orbit Yaw/Pitch, Pop Scale, Hold Time, Ana Amount, Size Depth, Motion Point, Wave Lerp.
+Sliders: Strength, Strictness, Wave Soft, Wave Radius, Orbit Yaw/Pitch, Pop Scale, Hold Time, Ana Amount, Size Depth, Motion Point, Wave Lerp, Edge Split, Edge Sense, Edge Lerp, Anticipate.
 
-Calibration tools: Reset, Front, Ana ON/OFF, Tracks / Motion / Height overlays, Relearn.
+Calibration tools: Reset, Front, Ana ON/OFF, Tracks / Motion / Height / Edges overlays, Relearn.
 
 ### Controls
 

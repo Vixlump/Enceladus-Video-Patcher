@@ -62,8 +62,8 @@ int controlSavedX = 920, controlSavedY = 80, controlSavedW = 960, controlSavedH 
 int windowWidth = 960, windowHeight = 720;
 float uiScale = 1.0f;
 int activeSlider = -1; // -1 means no slider is active
-// Encodes activeSlider as filterIdx * AE_SLIDER_STRIDE + paramType (0=strength .. 11=param11)
-const int AE_SLIDER_STRIDE = 12;
+// Encodes activeSlider as filterIdx * AE_SLIDER_STRIDE + paramType (0=strength .. 15=param15)
+const int AE_SLIDER_STRIDE = 16;
 float aePanelScroll = 0.0f; // scroll offset for tall Active Effects lists
 bool isSeeking = false;
 double videoDuration = 0;
@@ -264,6 +264,10 @@ public:
     virtual bool hasParam9() const { return false; }
     virtual bool hasParam10() const { return false; }
     virtual bool hasParam11() const { return false; }
+    virtual bool hasParam12() const { return false; }
+    virtual bool hasParam13() const { return false; }
+    virtual bool hasParam14() const { return false; }
+    virtual bool hasParam15() const { return false; }
     virtual std::string param1Name() const { return ""; }
     virtual std::string param2Name() const { return ""; }
     virtual std::string param3Name() const { return ""; }
@@ -275,6 +279,10 @@ public:
     virtual std::string param9Name() const { return ""; }
     virtual std::string param10Name() const { return ""; }
     virtual std::string param11Name() const { return ""; }
+    virtual std::string param12Name() const { return ""; }
+    virtual std::string param13Name() const { return ""; }
+    virtual std::string param14Name() const { return ""; }
+    virtual std::string param15Name() const { return ""; }
     virtual bool hasReset() const { return false; }
     virtual void reset() {}
     // Optional calibration / tool buttons drawn under a filter's sliders
@@ -297,6 +305,10 @@ public:
     float param9 = 0.5f;
     float param10 = 0.5f;
     float param11 = 0.35f;
+    float param12 = 0.0f;
+    float param13 = 0.5f;
+    float param14 = 0.45f;
+    float param15 = 0.35f;
     virtual ~VideoFilter() = default;
 };
 
@@ -628,8 +640,19 @@ class EnceladusVisionFilter : public VideoFilter {
     bool showTracks = false;
     bool showMotion = false;
     bool showHeight = false;
+    bool showEdges = false;
     bool anaglyphOn = true;
     static constexpr int kGrid = 80;
+
+    struct EdgeTrack {
+        float x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+        float nx = 0, ny = 1;
+        float len = 0;
+        float blend = 0.0f;
+        int age = 0;
+        int missed = 0;
+    };
+    std::vector<EdgeTrack> edgeTracks;
 
     struct Vert {
         float x, y, z, u, v;
@@ -773,33 +796,43 @@ class EnceladusVisionFilter : public VideoFilter {
             }
         }
 
-        // param11 = Wave Lerp: 0 = instant jump, higher = smoother in/out
+        // param11 = Wave Lerp: 0 = instant, 1 = very long ease (many frames)
+        // param15 = Anticipate: earlier lead-in + snappier rise / slower fall
         const int minAgeBlend = 4 + static_cast<int>((0.25f + param7 * 0.75f) * (8 + param1 * 20.0f));
         const float lerpSlider = std::max(0.0f, std::min(1.0f, param11));
+        const float antic = std::max(0.0f, std::min(1.0f, param15));
+        // High Wave Lerp → tiny alpha (can take ~2–4s at 30fps to settle)
         const float blendAlpha = (lerpSlider <= 0.001f)
             ? 1.0f
-            : (0.018f + (1.0f - lerpSlider) * (1.0f - lerpSlider) * 0.55f);
+            : (0.0035f + std::pow(1.0f - lerpSlider, 2.8f) * 0.52f);
+        const float riseAlpha = std::min(1.0f, blendAlpha * (1.0f + antic * 2.2f));
+        const float fallAlpha = std::max(0.002f, blendAlpha * (1.0f - antic * 0.55f));
+        // Anticipation: start pop earlier relative to Hold/Strictness maturity
+        const float startFrac = 0.50f - antic * 0.42f; // 0.50 → ~0.08
+        const int startAge = std::max(1, static_cast<int>(minAgeBlend * startFrac));
+        const int maxMissedFade = maxMissed + static_cast<int>(lerpSlider * 36.0f);
 
         for (auto& tr : tracks) {
             float target = 0.0f;
-            if (tr.missed == 0) {
+            if (tr.missed == 0 && tr.age >= startAge) {
+                // Softer maturity ramp; anticipation stretches the early part
                 float maturity = std::min(1.0f, tr.age / static_cast<float>(std::max(1, minAgeBlend)));
-                if (tr.age >= minAgeBlend / 2)
-                    target = maturity;
+                float shaped = std::pow(maturity, 1.0f - antic * 0.45f);
+                target = shaped;
             }
-            if (blendAlpha >= 0.999f)
+            float a = (target > tr.blend) ? riseAlpha : fallAlpha;
+            if (a >= 0.999f)
                 tr.blend = target;
             else
-                tr.blend += (target - tr.blend) * blendAlpha;
+                tr.blend += (target - tr.blend) * a;
             if (tr.blend < 0.0f) tr.blend = 0.0f;
             if (tr.blend > 1.0f) tr.blend = 1.0f;
         }
 
         tracks.erase(std::remove_if(tracks.begin(), tracks.end(),
                                     [&](const Track& t) {
-                                        if (t.missed <= maxMissed) return false;
-                                        // Keep fading tracks while blend remains visible
-                                        if (lerpSlider > 0.001f && t.blend > 0.02f) return false;
+                                        if (t.missed <= maxMissedFade) return false;
+                                        if (lerpSlider > 0.001f && t.blend > 0.015f) return false;
                                         return true;
                                     }),
                      tracks.end());
@@ -814,11 +847,234 @@ class EnceladusVisionFilter : public VideoFilter {
             t.halfH = detections[i].halfH;
             float rel = static_cast<float>(std::sqrt(detections[i].area / std::max(1.0, frameArea)));
             t.sizeNorm = std::max(0.0f, std::min(1.0f, rel / 0.42f));
-            t.blend = (lerpSlider <= 0.001f) ? 0.0f : 0.0f; // starts at 0, lerps up
+            t.blend = 0.0f;
             t.age = 1;
             t.missed = 0;
             tracks.push_back(t);
         }
+    }
+
+    static float segAlignScore(float ax0, float ay0, float ax1, float ay1,
+                               float bx0, float by0, float bx1, float by1,
+                               float diag) {
+        float amx = 0.5f * (ax0 + ax1), amy = 0.5f * (ay0 + ay1);
+        float bmx = 0.5f * (bx0 + bx1), bmy = 0.5f * (by0 + by1);
+        float dmid = std::sqrt((amx - bmx) * (amx - bmx) + (amy - bmy) * (amy - bmy));
+        float adx = ax1 - ax0, ady = ay1 - ay0;
+        float bdx = bx1 - bx0, bdy = by1 - by0;
+        float al = std::sqrt(adx * adx + ady * ady);
+        float bl = std::sqrt(bdx * bdx + bdy * bdy);
+        if (al < 1e-3f || bl < 1e-3f) return 0.0f;
+        float align = std::fabs((adx * bdx + ady * bdy) / (al * bl));
+        float midOk = 1.0f - std::min(1.0f, dmid / (0.08f * diag));
+        return align * midOk;
+    }
+
+    // Straight-ish edges with persistence: only long-lived tracks drive the split.
+    void updateEdges(const cv::Mat& frame) {
+        if (param12 < 0.02f) {
+            for (auto& e : edgeTracks) {
+                e.missed += 1;
+                e.blend *= 0.85f;
+            }
+            edgeTracks.erase(std::remove_if(edgeTracks.begin(), edgeTracks.end(),
+                                            [](const EdgeTrack& e) {
+                                                return e.missed > 20 && e.blend < 0.02f;
+                                            }),
+                             edgeTracks.end());
+            return;
+        }
+
+        cv::Mat gray, blur, edges;
+        cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+        cv::GaussianBlur(gray, blur, cv::Size(7, 7), 0);
+
+        // param13 = Edge Sense (kept conservative — high end still picky)
+        const float sense = std::max(0.0f, std::min(1.0f, param13));
+        const double cannyLo = 70.0 + (1.0 - sense) * 90.0;
+        const double cannyHi = 160.0 + (1.0 - sense) * 90.0;
+        cv::Canny(blur, edges, cannyLo, cannyHi);
+
+        const int diag = std::max(frame.cols, frame.rows);
+        const double minLen = std::max(40.0, diag * (0.20 - sense * 0.07));
+        const int houghThresh = std::max(45, static_cast<int>(95 - sense * 35.0));
+        const double maxGap = 4.0 + sense * 10.0;
+
+        std::vector<cv::Vec4i> lines;
+        cv::HoughLinesP(edges, lines, 1.0, CV_PI / 180.0, houghThresh, minLen, maxGap);
+
+        struct Det { float x0, y0, x1, y1, nx, ny, len; };
+        std::vector<Det> dets;
+        for (const auto& L : lines) {
+            float x0 = static_cast<float>(L[0]), y0 = static_cast<float>(L[1]);
+            float x1 = static_cast<float>(L[2]), y1 = static_cast<float>(L[3]);
+            float dx = x1 - x0, dy = y1 - y0;
+            float len = std::sqrt(dx * dx + dy * dy);
+            if (len < minLen * 0.9f) continue;
+            float inv = 1.0f / len;
+            dets.push_back({x0, y0, x1, y1, -dy * inv, dx * inv, len});
+        }
+        std::sort(dets.begin(), dets.end(),
+                  [](const Det& a, const Det& b) { return a.len > b.len; });
+
+        // Dedup detections
+        std::vector<Det> unique;
+        const int maxDet = 10;
+        for (const auto& d : dets) {
+            if (static_cast<int>(unique.size()) >= maxDet) break;
+            bool dup = false;
+            for (const auto& u : unique) {
+                if (segAlignScore(d.x0, d.y0, d.x1, d.y1, u.x0, u.y0, u.x1, u.y1,
+                                  static_cast<float>(diag)) > 0.78f) {
+                    dup = true; break;
+                }
+            }
+            if (!dup) unique.push_back(d);
+        }
+
+        std::vector<char> used(unique.size(), 0);
+        for (auto& tr : edgeTracks) {
+            int best = -1;
+            float bestScore = 0.55f;
+            for (size_t i = 0; i < unique.size(); ++i) {
+                if (used[i]) continue;
+                float sc = segAlignScore(tr.x0, tr.y0, tr.x1, tr.y1,
+                                         unique[i].x0, unique[i].y0, unique[i].x1, unique[i].y1,
+                                         static_cast<float>(diag));
+                if (sc > bestScore) { bestScore = sc; best = static_cast<int>(i); }
+            }
+            if (best >= 0) {
+                const auto& d = unique[best];
+                // Smooth geometry so the tear doesn't jitter
+                tr.x0 = tr.x0 * 0.72f + d.x0 * 0.28f;
+                tr.y0 = tr.y0 * 0.72f + d.y0 * 0.28f;
+                tr.x1 = tr.x1 * 0.72f + d.x1 * 0.28f;
+                tr.y1 = tr.y1 * 0.72f + d.y1 * 0.28f;
+                float dx = tr.x1 - tr.x0, dy = tr.y1 - tr.y0;
+                tr.len = std::sqrt(dx * dx + dy * dy);
+                if (tr.len > 1e-3f) {
+                    float inv = 1.0f / tr.len;
+                    float nnx = -dy * inv, nny = dx * inv;
+                    // Keep normal continuous (don't flip each frame)
+                    if (nnx * tr.nx + nny * tr.ny < 0.0f) { nnx = -nnx; nny = -nny; }
+                    tr.nx = tr.nx * 0.7f + nnx * 0.3f;
+                    tr.ny = tr.ny * 0.7f + nny * 0.3f;
+                    float nlen = std::sqrt(tr.nx * tr.nx + tr.ny * tr.ny);
+                    if (nlen > 1e-4f) { tr.nx /= nlen; tr.ny /= nlen; }
+                }
+                tr.age += 1;
+                tr.missed = 0;
+                used[best] = 1;
+            } else {
+                tr.missed += 1;
+            }
+        }
+
+        // param14 = Edge Lerp
+        const float edgeLerp = std::max(0.0f, std::min(1.0f, param14));
+        const float edgeAlpha = (edgeLerp <= 0.001f)
+            ? 1.0f
+            : (0.004f + std::pow(1.0f - edgeLerp, 2.6f) * 0.48f);
+        const int minEdgeAge = 8 + static_cast<int>((1.0f - sense) * 18.0f + edgeLerp * 20.0f);
+        const int maxEdgeMissed = 10 + static_cast<int>(edgeLerp * 28.0f);
+
+        for (auto& tr : edgeTracks) {
+            float target = 0.0f;
+            if (tr.missed == 0 && tr.age >= minEdgeAge)
+                target = std::min(1.0f, (tr.age - minEdgeAge + 1) / static_cast<float>(std::max(6, minEdgeAge / 2)));
+            if (edgeAlpha >= 0.999f)
+                tr.blend = target;
+            else
+                tr.blend += (target - tr.blend) * edgeAlpha;
+            tr.blend = std::max(0.0f, std::min(1.0f, tr.blend));
+        }
+
+        edgeTracks.erase(std::remove_if(edgeTracks.begin(), edgeTracks.end(),
+                                        [&](const EdgeTrack& e) {
+                                            if (e.missed <= maxEdgeMissed) return false;
+                                            if (edgeLerp > 0.001f && e.blend > 0.015f) return false;
+                                            return true;
+                                        }),
+                         edgeTracks.end());
+
+        for (size_t i = 0; i < unique.size(); ++i) {
+            if (used[i]) continue;
+            if (static_cast<int>(edgeTracks.size()) >= 8) break;
+            EdgeTrack t;
+            t.x0 = unique[i].x0; t.y0 = unique[i].y0;
+            t.x1 = unique[i].x1; t.y1 = unique[i].y1;
+            t.nx = unique[i].nx; t.ny = unique[i].ny;
+            t.len = unique[i].len;
+            t.blend = 0.0f;
+            t.age = 1;
+            t.missed = 0;
+            edgeTracks.push_back(t);
+        }
+    }
+
+    struct EdgeSample {
+        float h = 0.0f;
+        float ox = 0.0f;
+        float oy = 0.0f;
+    };
+
+    // Push mesh sides apart across persistent, lerped edge tracks.
+    EdgeSample sampleEdgeSplit(float u, float v, int frameW, int frameH) const {
+        EdgeSample out;
+        if (param12 < 0.02f || edgeTracks.empty()) return out;
+
+        const float px = u * std::max(1, frameW - 1);
+        const float py = v * std::max(1, frameH - 1);
+        const float diag = std::sqrt(static_cast<float>(frameW * frameW + frameH * frameH));
+        const float band = (0.018f + param12 * 0.09f) * diag;
+        const float pop = popScaleCurve(param6);
+        const float sepAmt = param12 * (0.05f + strength * 0.28f) * pop;
+
+        float bestDist = 1e9f;
+        float bestNx = 0.0f, bestNy = 0.0f;
+        float bestSign = 1.0f;
+        float bestBlend = 0.0f;
+
+        for (const auto& e : edgeTracks) {
+            if (e.blend < 0.02f) continue;
+            float dx = e.x1 - e.x0;
+            float dy = e.y1 - e.y0;
+            float len2 = dx * dx + dy * dy;
+            float t = (len2 > 1e-4f) ? ((px - e.x0) * dx + (py - e.y0) * dy) / len2 : 0.0f;
+            t = std::max(0.0f, std::min(1.0f, t));
+            float qx = e.x0 + t * dx;
+            float qy = e.y0 + t * dy;
+            float ex = px - qx;
+            float ey = py - qy;
+            float dist = std::sqrt(ex * ex + ey * ey);
+            if (dist >= bestDist) continue;
+            bestDist = dist;
+            bestBlend = e.blend;
+            float side = ex * e.nx + ey * e.ny;
+            bestSign = (side >= 0.0f) ? 1.0f : -1.0f;
+            if (dist > 0.75f) {
+                bestNx = ex / dist;
+                bestNy = ey / dist;
+            } else {
+                bestNx = e.nx * bestSign;
+                bestNy = e.ny * bestSign;
+                bestSign = 1.0f;
+            }
+        }
+
+        if (bestDist > band * 1.05f || bestBlend < 0.02f) return out;
+
+        float fall = 1.0f - bestDist / std::max(1e-3f, band);
+        fall = fall * fall;
+        float push = bestSign * sepAmt * fall * bestBlend;
+        out.ox = bestNx * push;
+        out.oy = -bestNy * push;
+
+        float ridgeBand = band * 0.28f;
+        float ridge = 1.0f - std::min(1.0f, bestDist / std::max(1e-3f, ridgeBand));
+        ridge = ridge * ridge;
+        out.h = ridge * param12 * (0.025f + strength * 0.14f) * pop * 0.55f * bestBlend;
+        return out;
     }
 
     // Pop Scale slider: fine fractional control at the low end, still reaches a large high end.
@@ -898,7 +1154,7 @@ class EnceladusVisionFilter : public VideoFilter {
     }
 
     float heightAt(float u, float v, int frameW, int frameH) const {
-        return sampleWave(u, v, frameW, frameH).h;
+        return sampleWave(u, v, frameW, frameH).h + sampleEdgeSplit(u, v, frameW, frameH).h;
     }
 
     cv::Mat buildHeightMap(int rows, int cols) const {
@@ -960,6 +1216,7 @@ public:
         if (!enabled || frame.empty()) return frame;
 
         updateTracks(frame);
+        updateEdges(frame);
 
         // Always render a textured mesh. Frontal (yaw=0.5, pitch=0) maps the flat
         // plane 1:1 into the frame; extruded tracks pop toward the camera. Orbit
@@ -999,9 +1256,10 @@ public:
                 float px = (u - 0.5f) * 2.0f * aspect;
                 float py = (0.5f - v) * 2.0f;
                 WaveSample w = sampleWave(u, v, frame.cols, frame.rows);
-                px += w.ox;
-                py += w.oy;
-                float pz = w.h;
+                EdgeSample e = sampleEdgeSplit(u, v, frame.cols, frame.rows);
+                px += w.ox + e.ox;
+                py += w.oy + e.oy;
+                float pz = w.h + e.h;
 
                 // Yaw around Y, then pitch around X
                 float x1 = px * cy + pz * sy;
@@ -1103,6 +1361,25 @@ public:
                             cv::FONT_HERSHEY_SIMPLEX, 0.4, col, 1, cv::LINE_AA);
             }
         }
+        if (showEdges) {
+            for (const auto& e : edgeTracks) {
+                cv::Scalar col = e.blend > 0.45f ? cv::Scalar(0, 220, 255)
+                               : (e.age > 4 ? cv::Scalar(0, 140, 220) : cv::Scalar(80, 80, 160));
+                int thickness = e.blend > 0.45f ? 2 : 1;
+                cv::line(output,
+                         {static_cast<int>(e.x0), static_cast<int>(e.y0)},
+                         {static_cast<int>(e.x1), static_cast<int>(e.y1)},
+                         col, thickness, cv::LINE_AA);
+                if (e.blend > 0.2f) {
+                    float mx = 0.5f * (e.x0 + e.x1);
+                    float my = 0.5f * (e.y0 + e.y1);
+                    cv::arrowedLine(output,
+                                    {static_cast<int>(mx), static_cast<int>(my)},
+                                    {static_cast<int>(mx + e.nx * 18.0f), static_cast<int>(my + e.ny * 18.0f)},
+                                    cv::Scalar(255, 120, 40), 1, cv::LINE_AA, 0, 0.35);
+                }
+            }
+        }
 
         return output;
     }
@@ -1119,7 +1396,11 @@ public:
         param8 = 0.55f;  // Ana Amount
         param9 = 0.65f;  // Size Depth
         param10 = 0.55f; // Motion Point
-        param11 = 0.4f;  // Wave Lerp (0 = instant)
+        param11 = 0.55f; // Wave Lerp (higher = much longer ease)
+        param12 = 0.45f; // Edge Split
+        param13 = 0.22f; // Edge Sense (conservative)
+        param14 = 0.55f; // Edge Lerp
+        param15 = 0.40f; // Anticipate
         anaglyphOn = true;
     }
 
@@ -1127,6 +1408,7 @@ public:
         tracks.clear();
         lastMotion.release();
         subtractor.release();
+        edgeTracks.clear();
     }
 
     void reset() override {
@@ -1135,6 +1417,7 @@ public:
         showTracks = false;
         showMotion = false;
         showHeight = false;
+        showEdges = false;
     }
 
     std::string name() const override { return "EnceladusVision"; }
@@ -1149,6 +1432,10 @@ public:
     bool hasParam9() const override { return true; }
     bool hasParam10() const override { return true; }
     bool hasParam11() const override { return true; }
+    bool hasParam12() const override { return true; }
+    bool hasParam13() const override { return true; }
+    bool hasParam14() const override { return true; }
+    bool hasParam15() const override { return true; }
     std::string param1Name() const override { return "Strictness"; }
     std::string param2Name() const override { return "Wave Soft"; }
     std::string param3Name() const override { return "Wave Radius"; }
@@ -1160,9 +1447,13 @@ public:
     std::string param9Name() const override { return "Size Depth"; }
     std::string param10Name() const override { return "Motion Point"; }
     std::string param11Name() const override { return "Wave Lerp"; }
+    std::string param12Name() const override { return "Edge Split"; }
+    std::string param13Name() const override { return "Edge Sense"; }
+    std::string param14Name() const override { return "Edge Lerp"; }
+    std::string param15Name() const override { return "Anticipate"; }
     bool hasReset() const override { return true; }
 
-    int toolButtonCount() const override { return 7; }
+    int toolButtonCount() const override { return 8; }
     std::string toolButtonName(int i) const override {
         switch (i) {
             case 0: return "Reset";
@@ -1171,7 +1462,8 @@ public:
             case 3: return "Tracks";
             case 4: return "Motion";
             case 5: return "Height";
-            case 6: return "Relearn";
+            case 6: return "Edges";
+            case 7: return "Relearn";
             default: return "";
         }
     }
@@ -1181,6 +1473,7 @@ public:
             case 3: return showTracks;
             case 4: return showMotion;
             case 5: return showHeight;
+            case 6: return showEdges;
             default: return false;
         }
     }
@@ -1192,7 +1485,8 @@ public:
             case 3: showTracks = !showTracks; break;
             case 4: showMotion = !showMotion; break;
             case 5: showHeight = !showHeight; break;
-            case 6: resetTracking(); break;
+            case 6: showEdges = !showEdges; break;
+            case 7: resetTracking(); break;
             default: break;
         }
     }
@@ -1201,9 +1495,13 @@ public:
         const int minAge = 4 + static_cast<int>((0.25f + param7 * 0.75f) * (8 + param1 * 20.0f));
         for (const auto& tr : tracks)
             if (tr.blend > 0.5f || tr.age >= minAge) ++mature;
+        int liveEdges = 0;
+        for (const auto& e : edgeTracks)
+            if (e.blend > 0.45f) ++liveEdges;
         std::string ana = anaglyphOn ? "ana on" : "ana off";
         return "tracks " + std::to_string(tracks.size()) +
                "  live " + std::to_string(mature) +
+               "  edges " + std::to_string(liveEdges) + "/" + std::to_string(edgeTracks.size()) +
                "  " + ana;
     }
 };
@@ -2953,6 +3251,10 @@ float activeEffectsContentHeight() {
         if (filter->hasParam9()) h += AE_SLIDER_STEP;
         if (filter->hasParam10()) h += AE_SLIDER_STEP;
         if (filter->hasParam11()) h += AE_SLIDER_STEP;
+        if (filter->hasParam12()) h += AE_SLIDER_STEP;
+        if (filter->hasParam13()) h += AE_SLIDER_STEP;
+        if (filter->hasParam14()) h += AE_SLIDER_STEP;
+        if (filter->hasParam15()) h += AE_SLIDER_STEP;
         int tools = filter->toolButtonCount();
         if (tools > 0) {
             int rows = (tools + 1) / 2;
@@ -3039,6 +3341,10 @@ void drawActiveEffectsPanel() {
         if (filters[i]->hasParam9()) drawParam(filters[i]->param9, filters[i]->param9Name());
         if (filters[i]->hasParam10()) drawParam(filters[i]->param10, filters[i]->param10Name());
         if (filters[i]->hasParam11()) drawParam(filters[i]->param11, filters[i]->param11Name());
+        if (filters[i]->hasParam12()) drawParam(filters[i]->param12, filters[i]->param12Name());
+        if (filters[i]->hasParam13()) drawParam(filters[i]->param13, filters[i]->param13Name());
+        if (filters[i]->hasParam14()) drawParam(filters[i]->param14, filters[i]->param14Name());
+        if (filters[i]->hasParam15()) drawParam(filters[i]->param15, filters[i]->param15Name());
 
         int tools = filters[i]->toolButtonCount();
         if (tools > 0) {
@@ -3111,6 +3417,10 @@ bool hitTestActiveEffectsSliders(float fx, float fy) {
         if (filters[i]->hasParam9() && trySlider(9, filters[i]->param9)) return true;
         if (filters[i]->hasParam10() && trySlider(10, filters[i]->param10)) return true;
         if (filters[i]->hasParam11() && trySlider(11, filters[i]->param11)) return true;
+        if (filters[i]->hasParam12() && trySlider(12, filters[i]->param12)) return true;
+        if (filters[i]->hasParam13() && trySlider(13, filters[i]->param13)) return true;
+        if (filters[i]->hasParam14() && trySlider(14, filters[i]->param14)) return true;
+        if (filters[i]->hasParam15() && trySlider(15, filters[i]->param15)) return true;
 
         int tools = filters[i]->toolButtonCount();
         if (tools > 0) {
@@ -3709,6 +4019,10 @@ void mouseMotion(int x, int y) {
         case 9: filters[filterIdx]->param9 = normalizedValue; break;
         case 10: filters[filterIdx]->param10 = normalizedValue; break;
         case 11: filters[filterIdx]->param11 = normalizedValue; break;
+        case 12: filters[filterIdx]->param12 = normalizedValue; break;
+        case 13: filters[filterIdx]->param13 = normalizedValue; break;
+        case 14: filters[filterIdx]->param14 = normalizedValue; break;
+        case 15: filters[filterIdx]->param15 = normalizedValue; break;
     }
 
     glutPostRedisplay();
@@ -3847,6 +4161,10 @@ void keyboard(unsigned char key, int x, int y) {
                     case 9: filters[filterIdx]->param9 = std::max(0.0f, filters[filterIdx]->param9 - step); break;
                     case 10: filters[filterIdx]->param10 = std::max(0.0f, filters[filterIdx]->param10 - step); break;
                     case 11: filters[filterIdx]->param11 = std::max(0.0f, filters[filterIdx]->param11 - step); break;
+                    case 12: filters[filterIdx]->param12 = std::max(0.0f, filters[filterIdx]->param12 - step); break;
+                    case 13: filters[filterIdx]->param13 = std::max(0.0f, filters[filterIdx]->param13 - step); break;
+                    case 14: filters[filterIdx]->param14 = std::max(0.0f, filters[filterIdx]->param14 - step); break;
+                    case 15: filters[filterIdx]->param15 = std::max(0.0f, filters[filterIdx]->param15 - step); break;
                 }
             } else {
                 videoScale = std::max(VIDEO_SCALE_MIN, videoScale - 0.05f);
@@ -3871,6 +4189,10 @@ void keyboard(unsigned char key, int x, int y) {
                     case 9: filters[filterIdx]->param9 = std::min(1.0f, filters[filterIdx]->param9 + step); break;
                     case 10: filters[filterIdx]->param10 = std::min(1.0f, filters[filterIdx]->param10 + step); break;
                     case 11: filters[filterIdx]->param11 = std::min(1.0f, filters[filterIdx]->param11 + step); break;
+                    case 12: filters[filterIdx]->param12 = std::min(1.0f, filters[filterIdx]->param12 + step); break;
+                    case 13: filters[filterIdx]->param13 = std::min(1.0f, filters[filterIdx]->param13 + step); break;
+                    case 14: filters[filterIdx]->param14 = std::min(1.0f, filters[filterIdx]->param14 + step); break;
+                    case 15: filters[filterIdx]->param15 = std::min(1.0f, filters[filterIdx]->param15 + step); break;
                 }
             } else {
                 videoScale = std::min(VIDEO_SCALE_MAX, videoScale + 0.05f);
