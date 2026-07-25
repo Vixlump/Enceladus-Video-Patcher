@@ -662,6 +662,7 @@ class EnceladusVisionFilter : public VideoFilter {
     bool edgeOn = true;
     bool anaglyphOn = true;
     bool motion3DOn = false;
+    bool barSpillOn = false;
     static constexpr int kGrid = 80;
 
     struct EdgeTrack {
@@ -1048,6 +1049,60 @@ class EnceladusVisionFilter : public VideoFilter {
         return std::max(0.0f, std::min(1.0f, strength));
     }
 
+    // Find active picture inside letterbox / pillarbox (black bars).
+    static cv::Rect detectContentRect(const cv::Mat& bgr) {
+        if (bgr.empty()) return cv::Rect();
+        cv::Mat gray;
+        if (bgr.channels() == 1) gray = bgr;
+        else cv::cvtColor(bgr, gray, cv::COLOR_BGR2GRAY);
+
+        auto rowLit = [&](int y) {
+            cv::Scalar m, s;
+            cv::meanStdDev(gray.row(y), m, s);
+            return m[0] > 12.0 || s[0] > 6.0;
+        };
+        auto colLit = [&](int x) {
+            cv::Scalar m, s;
+            cv::meanStdDev(gray.col(x), m, s);
+            return m[0] > 12.0 || s[0] > 6.0;
+        };
+
+        int top = 0, bot = gray.rows - 1, left = 0, right = gray.cols - 1;
+        while (top < bot && !rowLit(top)) ++top;
+        while (bot > top && !rowLit(bot)) --bot;
+        while (left < right && !colLit(left)) ++left;
+        while (right > left && !colLit(right)) --right;
+
+        // Slight inset avoid noisy edge pixels; keep even dims for safety
+        top = std::max(0, top - 1);
+        left = std::max(0, left - 1);
+        bot = std::min(gray.rows - 1, bot + 1);
+        right = std::min(gray.cols - 1, right + 1);
+        int w = std::max(2, right - left + 1);
+        int h = std::max(2, bot - top + 1);
+        if (w % 2) { if (left + w < gray.cols) ++w; else if (w > 2) --w; }
+        if (h % 2) { if (top + h < gray.rows) ++h; else if (h > 2) --h; }
+        return cv::Rect(left, top, w, h);
+    }
+
+    // Prepare canvas + content rect for Bar Spill: use existing bars, or add overscan pad.
+    static void prepareBarSpillCanvas(const cv::Mat& frame, cv::Mat& work, cv::Rect& content) {
+        content = detectContentRect(frame);
+        const double area = static_cast<double>(frame.cols) * frame.rows;
+        const double fill = content.area() / std::max(1.0, area);
+        // Meaningful letterbox/pillarbox already present
+        if (fill < 0.94 && content.width > 8 && content.height > 8) {
+            work = frame;
+            return;
+        }
+        // No usable bars — add overscan pad so 3D can spill instead of clipping
+        const int padX = std::max(4, static_cast<int>(std::lround(frame.cols * 0.07)));
+        const int padY = std::max(4, static_cast<int>(std::lround(frame.rows * 0.07)));
+        cv::copyMakeBorder(frame, work, padY, padY, padX, padX,
+                           cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
+        content = cv::Rect(padX, padY, frame.cols, frame.rows);
+    }
+
     static float popScaleCurve(float t) {
         t = std::max(0.0f, std::min(1.0f, t));
         const float shaped = std::pow(t, 2.35f);
@@ -1300,13 +1355,22 @@ public:
     cv::Mat apply(const cv::Mat& frame) override {
         if (!enabled || frame.empty()) return frame;
 
-        updateTracks(frame);
-        updateEdges(frame);
+        cv::Mat work;
+        cv::Rect content(0, 0, frame.cols, frame.rows);
+        if (barSpillOn) {
+            prepareBarSpillCanvas(frame, work, content);
+        } else {
+            work = frame;
+            content = cv::Rect(0, 0, frame.cols, frame.rows);
+        }
+
+        updateTracks(work);
+        updateEdges(work);
         updateMotionField();
 
         // Always render a textured mesh. Frontal (yaw=0.5, pitch=0) maps the flat
-        // plane 1:1 into the frame; extruded tracks pop toward the camera. Orbit
-        // rotates that same plane — no separate "background video" underlay.
+        // plane 1:1 into the content rect; extruded tracks pop toward the camera.
+        // Bar Spill: home plane = active picture; overflow draws into letterbox bars.
         const float yaw = (param4 - 0.5f) * static_cast<float>(M_PI); // ±90°
         const float pitch = param5 * 1.15f;                            // 0 = flat
         const bool orbiting = std::fabs(yaw) > 0.02f || pitch > 0.02f;
@@ -1314,21 +1378,35 @@ public:
         const float camDist = focal; // identity fill when flat / no height
         const float cy = std::cos(yaw), sy = std::sin(yaw);
         const float cp = std::cos(pitch), sp = std::sin(pitch);
-        const float aspect = static_cast<float>(frame.cols) / std::max(1, frame.rows);
+        const float aspect = static_cast<float>(content.width) / std::max(1, content.height);
 
         const int maxW = 640;
         float resScale = 1.0f;
-        int rw = frame.cols, rh = frame.rows;
+        int rw = work.cols, rh = work.rows;
         if (rw > maxW) {
             resScale = static_cast<float>(maxW) / rw;
             rw = maxW;
-            rh = std::max(1, static_cast<int>(frame.rows * resScale));
+            rh = std::max(1, static_cast<int>(work.rows * resScale));
         }
+        const float cL = content.x * resScale;
+        const float cT = content.y * resScale;
+        const float cW = std::max(1.0f, content.width * resScale);
+        const float cH = std::max(1.0f, content.height * resScale);
+
         cv::Mat tex;
-        if (resScale < 0.999f)
-            cv::resize(frame, tex, cv::Size(rw, rh), 0, 0, cv::INTER_AREA);
-        else
-            tex = frame;
+        cv::Mat contentMat = work(content);
+        if (barSpillOn) {
+            int tw = std::max(1, static_cast<int>(std::lround(cW)));
+            int th = std::max(1, static_cast<int>(std::lround(cH)));
+            if (contentMat.cols != tw || contentMat.rows != th)
+                cv::resize(contentMat, tex, cv::Size(tw, th), 0, 0, cv::INTER_AREA);
+            else
+                tex = contentMat;
+        } else if (resScale < 0.999f) {
+            cv::resize(work, tex, cv::Size(rw, rh), 0, 0, cv::INTER_AREA);
+        } else {
+            tex = work;
+        }
 
         std::vector<Vert> verts(static_cast<size_t>((kGrid + 1) * (kGrid + 1)));
         for (int j = 0; j <= kGrid; ++j) {
@@ -1339,11 +1417,21 @@ public:
                 vt.u = u;
                 vt.v = v;
 
+                // Sample effects in full work pixel space (tracks live there)
+                float sampleU = (content.x + u * std::max(1, content.width - 1))
+                              / static_cast<float>(std::max(1, work.cols - 1));
+                float sampleV = (content.y + v * std::max(1, content.height - 1))
+                              / static_cast<float>(std::max(1, work.rows - 1));
+                if (!barSpillOn) {
+                    sampleU = u;
+                    sampleV = v;
+                }
+
                 float px = (u - 0.5f) * 2.0f * aspect;
                 float py = (0.5f - v) * 2.0f;
-                WaveSample w = sampleWave(u, v, frame.cols, frame.rows);
-                EdgeSample e = sampleEdgeSplit(u, v, frame.cols, frame.rows);
-                WaveSample m = sampleMotion3D(u, v, frame.cols, frame.rows);
+                WaveSample w = sampleWave(sampleU, sampleV, work.cols, work.rows);
+                EdgeSample e = sampleEdgeSplit(sampleU, sampleV, work.cols, work.rows);
+                WaveSample m = sampleMotion3D(sampleU, sampleV, work.cols, work.rows);
                 px += w.ox + e.ox + m.ox;
                 py += w.oy + e.oy + m.oy;
                 float pz = w.h + e.h + m.h;
@@ -1357,12 +1445,13 @@ public:
                 float viewZ = camDist - z2;
                 vt.iw = 1.0f / std::max(0.12f, viewZ);
                 float persp = focal * vt.iw;
-                vt.sx = (0.5f + 0.5f * (x1 * persp) / aspect) * (rw - 1);
-                vt.sy = (0.5f - 0.5f * (y2 * persp)) * (rh - 1);
+                // Home plane fills the content rect; spill may draw into letterbox
+                vt.sx = cL + (0.5f + 0.5f * (x1 * persp) / aspect) * (cW - 1.0f);
+                vt.sy = cT + (0.5f - 0.5f * (y2 * persp)) * (cH - 1.0f);
             }
         }
 
-        // When orbiting, fit the projected plane into the frame so we don't clip oddly
+        // When orbiting, fit the projected plane into the canvas so we don't clip oddly
         if (orbiting) {
             float minSX = 1e9f, maxSX = -1e9f, minSY = 1e9f, maxSY = -1e9f;
             for (const auto& vt : verts) {
@@ -1382,7 +1471,7 @@ public:
             }
         }
 
-        // Dark clear — mesh only (fixes "video in background + rotated copy")
+        // Dark clear — mesh only; letterbox bars stay black until spill draws into them
         cv::Mat small(rh, rw, CV_8UC3, cv::Scalar(8, 8, 10));
         cv::Mat zbuf(rh, rw, CV_32FC1, cv::Scalar(0));
 
@@ -1400,12 +1489,12 @@ public:
 
         cv::Mat output;
         if (resScale < 0.999f)
-            cv::resize(small, output, frame.size(), 0, 0, cv::INTER_LINEAR);
+            cv::resize(small, output, work.size(), 0, 0, cv::INTER_LINEAR);
         else
             output = small;
 
         // Soft anaglyph (toggle + amount slider)
-        cv::Mat heightMap = buildHeightMap(frame.rows, frame.cols);
+        cv::Mat heightMap = buildHeightMap(work.rows, work.cols);
         double minV = 0, maxV = 0;
         cv::minMaxLoc(heightMap, &minV, &maxV);
         if (anaglyphOn && maxV > 0.02 && param8 > 0.05f)
@@ -1467,6 +1556,9 @@ public:
                 }
             }
         }
+        if (barSpillOn && showEdges) {
+            cv::rectangle(output, content, cv::Scalar(180, 140, 40), 1, cv::LINE_AA);
+        }
 
         return output;
     }
@@ -1495,6 +1587,7 @@ public:
         popOn = true;
         edgeOn = true;
         motion3DOn = false;
+        barSpillOn = false;
         optionPage = 0;
     }
 
@@ -1516,6 +1609,7 @@ public:
         popOn = true;
         edgeOn = true;
         motion3DOn = false;
+        barSpillOn = false;
         optionPage = 0;
     }
 
@@ -1582,20 +1676,21 @@ public:
         }
     }
 
-    int toolButtonCount() const override { return 11; }
+    int toolButtonCount() const override { return 12; }
     std::string toolButtonName(int i) const override {
         switch (i) {
             case 0: return popOn ? "Pop ON" : "Pop";
             case 1: return edgeOn ? "Edge ON" : "Edge";
             case 2: return motion3DOn ? "Mot3D ON" : "Mot3D";
             case 3: return anaglyphOn ? "Ana ON" : "Ana";
-            case 4: return "Front";
-            case 5: return "Reset";
-            case 6: return "Tracks";
-            case 7: return "Motion";
-            case 8: return "Height";
-            case 9: return "EdDbg";
-            case 10: return "Relearn";
+            case 4: return barSpillOn ? "Bars ON" : "Bars";
+            case 5: return "Front";
+            case 6: return "Reset";
+            case 7: return "Tracks";
+            case 8: return "Motion";
+            case 9: return "Height";
+            case 10: return "EdDbg";
+            case 11: return "Relearn";
             default: return "";
         }
     }
@@ -1605,10 +1700,11 @@ public:
             case 1: return edgeOn;
             case 2: return motion3DOn;
             case 3: return anaglyphOn;
-            case 6: return showTracks;
-            case 7: return showMotion;
-            case 8: return showHeight;
-            case 9: return showEdges;
+            case 4: return barSpillOn;
+            case 7: return showTracks;
+            case 8: return showMotion;
+            case 9: return showHeight;
+            case 10: return showEdges;
             default: return false;
         }
     }
@@ -1618,13 +1714,14 @@ public:
             case 1: edgeOn = !edgeOn; if (edgeOn) optionPage = 2; break;
             case 2: motion3DOn = !motion3DOn; if (motion3DOn) optionPage = 4; break;
             case 3: anaglyphOn = !anaglyphOn; if (anaglyphOn) optionPage = 3; break;
-            case 4: param4 = 0.5f; param5 = 0.0f; break;
-            case 5: reset(); break;
-            case 6: showTracks = !showTracks; break;
-            case 7: showMotion = !showMotion; break;
-            case 8: showHeight = !showHeight; break;
-            case 9: showEdges = !showEdges; break;
-            case 10: resetTracking(); break;
+            case 4: barSpillOn = !barSpillOn; break;
+            case 5: param4 = 0.5f; param5 = 0.0f; break;
+            case 6: reset(); break;
+            case 7: showTracks = !showTracks; break;
+            case 8: showMotion = !showMotion; break;
+            case 9: showHeight = !showHeight; break;
+            case 10: showEdges = !showEdges; break;
+            case 11: resetTracking(); break;
             default: break;
         }
     }
@@ -1643,7 +1740,8 @@ public:
            << (popOn ? " | Pop" : "")
            << (edgeOn ? " | Edge" : "")
            << (motion3DOn ? " | Mot3D" : "")
-           << (anaglyphOn ? " | Ana" : "");
+           << (anaglyphOn ? " | Ana" : "")
+           << (barSpillOn ? " | Bars" : "");
         return ss.str();
     }
 };
@@ -4849,9 +4947,16 @@ void processCaptureFrame() {
         currentVideoTime = cap.get(cv::CAP_PROP_POS_MSEC) / 1000.0;
     }
 
+    // Letterbox before filters so 3D can spill into bars; crop still after
+    const bool letterBefore = (formatMode == 0 && formatAspectActive());
+    if (letterBefore)
+        frame = applyFormatAspect(frame);
+
     for (auto& filter : filters)
         frame = filter->apply(frame);
-    frame = applyFormatAspect(frame);
+
+    if (!letterBefore)
+        frame = applyFormatAspect(frame);
     frame = applyForcedResolution(frame);
     cv::flip(frame, frame, 0);
     latestFrame = frame;
