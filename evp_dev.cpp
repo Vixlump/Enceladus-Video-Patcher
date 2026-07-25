@@ -62,8 +62,8 @@ int controlSavedX = 920, controlSavedY = 80, controlSavedW = 960, controlSavedH 
 int windowWidth = 960, windowHeight = 720;
 float uiScale = 1.0f;
 int activeSlider = -1; // -1 means no slider is active
-// Encodes activeSlider as filterIdx * AE_SLIDER_STRIDE + paramType (0=strength .. 17=param17)
-const int AE_SLIDER_STRIDE = 18;
+// Encodes activeSlider as filterIdx * AE_SLIDER_STRIDE + paramType (0=strength .. 18=param18)
+const int AE_SLIDER_STRIDE = 19;
 float aePanelScroll = 0.0f; // scroll offset for tall Active Effects lists
 bool isSeeking = false;
 double videoDuration = 0;
@@ -285,8 +285,10 @@ public:
     virtual std::string param15Name() const { return ""; }
     virtual bool hasParam16() const { return false; }
     virtual bool hasParam17() const { return false; }
+    virtual bool hasParam18() const { return false; }
     virtual std::string param16Name() const { return ""; }
     virtual std::string param17Name() const { return ""; }
+    virtual std::string param18Name() const { return ""; }
     virtual bool hasReset() const { return false; }
     virtual void reset() {}
     // Optional calibration / tool buttons drawn under a filter's sliders
@@ -301,7 +303,7 @@ public:
     virtual int optionPageCount() const { return 1; }
     virtual std::string optionPageName(int /*i*/) const { return "Params"; }
     virtual bool showStrengthOnPage() const { return hasStrength(); }
-    virtual bool showParamOnPage(int /*paramIndex1to17*/) const { return true; }
+    virtual bool showParamOnPage(int /*paramIndex1to18*/) const { return true; }
     
     bool enabled = false;
     float strength = 1.0f;
@@ -322,6 +324,7 @@ public:
     float param15 = 0.35f;
     float param16 = 0.55f;
     float param17 = 0.45f;
+    float param18 = 0.85f;
     virtual ~VideoFilter() = default;
 };
 
@@ -655,6 +658,8 @@ class EnceladusVisionFilter : public VideoFilter {
     bool showMotion = false;
     bool showHeight = false;
     bool showEdges = false;
+    bool popOn = true;
+    bool edgeOn = true;
     bool anaglyphOn = true;
     bool motion3DOn = false;
     static constexpr int kGrid = 80;
@@ -887,7 +892,7 @@ class EnceladusVisionFilter : public VideoFilter {
 
     // Straight-ish edges with persistence: only long-lived tracks drive the split.
     void updateEdges(const cv::Mat& frame) {
-        if (param12 < 0.02f) {
+        if (!edgeOn || param12 < 0.02f) {
             for (auto& e : edgeTracks) {
                 e.missed += 1;
                 e.blend *= 0.85f;
@@ -1039,6 +1044,10 @@ class EnceladusVisionFilter : public VideoFilter {
         float oy = 0.0f;
     };
 
+    float masterAmt() const {
+        return std::max(0.0f, std::min(1.0f, strength));
+    }
+
     static float popScaleCurve(float t) {
         t = std::max(0.0f, std::min(1.0f, t));
         const float shaped = std::pow(t, 2.35f);
@@ -1046,16 +1055,18 @@ class EnceladusVisionFilter : public VideoFilter {
     }
 
     // Push mesh sides apart across persistent, lerped edge tracks.
+    // Scaled by Edge Strength × Master (independent of Pop).
     EdgeSample sampleEdgeSplit(float u, float v, int frameW, int frameH) const {
         EdgeSample out;
-        if (param12 < 0.02f || edgeTracks.empty()) return out;
+        if (!edgeOn || param12 < 0.02f || edgeTracks.empty()) return out;
 
         const float px = u * std::max(1, frameW - 1);
         const float py = v * std::max(1, frameH - 1);
         const float diag = std::sqrt(static_cast<float>(frameW * frameW + frameH * frameH));
-        const float band = (0.018f + param12 * 0.09f) * diag;
-        const float pop = popScaleCurve(param6);
-        const float sepAmt = param12 * (0.05f + strength * 0.28f) * pop;
+        const float edgeAmt = std::max(0.0f, std::min(1.0f, param12));
+        const float edgeScale = (0.04f + std::pow(edgeAmt, 1.55f) * 1.15f) * masterAmt();
+        const float band = (0.018f + edgeAmt * 0.09f) * diag;
+        const float sepAmt = edgeScale * 0.42f;
 
         float bestDist = 1e9f;
         float bestNx = 0.0f, bestNy = 0.0f;
@@ -1100,7 +1111,7 @@ class EnceladusVisionFilter : public VideoFilter {
         float ridgeBand = band * 0.28f;
         float ridge = 1.0f - std::min(1.0f, bestDist / std::max(1e-3f, ridgeBand));
         ridge = ridge * ridge;
-        out.h = ridge * param12 * (0.025f + strength * 0.14f) * pop * 0.55f * bestBlend;
+        out.h = ridge * edgeScale * 0.28f * bestBlend;
         return out;
     }
 
@@ -1116,12 +1127,13 @@ class EnceladusVisionFilter : public VideoFilter {
         cv::GaussianBlur(f, motionHeight, cv::Size(k, k), 0);
     }
 
-    // Mot3D: extrude the mesh from the motion mask / field.
+    // Mot3D: extrude from motion field. Scaled by Mot Strength × Master (not Pop).
     WaveSample sampleMotion3D(float u, float v, int frameW, int frameH) const {
         WaveSample out;
         if (!motion3DOn || motionHeight.empty()) return out;
         const float depth = std::max(0.0f, std::min(1.0f, param16));
         if (depth < 0.01f) return out;
+        const float motScale = (0.05f + std::pow(depth, 1.45f) * 1.05f) * masterAmt();
 
         float x = u * (motionHeight.cols - 1);
         float y = v * (motionHeight.rows - 1);
@@ -1136,8 +1148,7 @@ class EnceladusVisionFilter : public VideoFilter {
         float m11 = motionHeight.at<float>(y1, x1);
         float m = (m00 * (1 - tx) + m10 * tx) * (1 - ty) + (m01 * (1 - tx) + m11 * tx) * ty;
 
-        const float pop = popScaleCurve(param6);
-        out.h = m * depth * (0.06f + strength * 0.85f) * pop;
+        out.h = m * motScale;
 
         // Tip along local motion gradient (cheap finite difference)
         float gx = 0.0f, gy = 0.0f;
@@ -1151,7 +1162,7 @@ class EnceladusVisionFilter : public VideoFilter {
         }
         float gLen = std::sqrt(gx * gx + gy * gy);
         if (gLen > 1e-4f && m > 0.08f) {
-            float lean = depth * m * out.h * 0.55f;
+            float lean = motScale * m * out.h * 0.55f;
             out.ox = (gx / gLen) * lean;
             out.oy = -(gy / gLen) * lean; // image Y down → world Y up
         }
@@ -1160,11 +1171,15 @@ class EnceladusVisionFilter : public VideoFilter {
     }
 
     // Raised-cosine mound; depth scales with track size; tips toward motion.
+    // Scaled by Pop Strength × Pop Scale × Master (independent of Edge / Mot3D).
     WaveSample sampleWave(float u, float v, int frameW, int frameH) const {
+        WaveSample empty;
+        if (!popOn) return empty;
         const float radiusMul = 0.7f + param3 * 1.5f;
         const float softPow = 0.35f + param2 * 1.8f;
+        const float popStr = std::max(0.0f, std::min(1.0f, param18));
         const float pop = popScaleCurve(param6);
-        const float baseAmp = (0.08f + strength * 0.92f) * pop;
+        const float baseAmp = popStr * (0.08f + 0.92f) * pop * masterAmt();
         const float sizeAmt = param9;   // Size Depth
         const float pointAmt = param10; // Motion Point
         const float diag = std::sqrt(static_cast<float>(frameW * frameW + frameH * frameH));
@@ -1250,7 +1265,7 @@ class EnceladusVisionFilter : public VideoFilter {
             for (int x = 0; x < heightMap.cols; ++x)
                 maxH = std::max(maxH, row[x]);
         }
-        float maxDisp = 1.0f + param8 * (4.0f + strength * 18.0f);
+        float maxDisp = (1.0f + param8 * 22.0f) * masterAmt();
         cv::Mat mapLx(scene.rows, scene.cols, CV_32FC1);
         cv::Mat mapLy(scene.rows, scene.cols, CV_32FC1);
         cv::Mat mapRx(scene.rows, scene.cols, CV_32FC1);
@@ -1457,7 +1472,7 @@ public:
     }
 
     void applyDefaultParams() {
-        strength = 0.85f;
+        strength = 1.0f; // Master Strength (scales all effects)
         param1 = 0.35f;  // Strictness
         param2 = 0.45f;  // Wave Soft
         param3 = 0.65f;  // Wave Radius
@@ -1465,17 +1480,20 @@ public:
         param5 = 0.0f;   // Orbit Pitch
         param6 = 0.55f;  // Pop Scale
         param7 = 0.4f;   // Hold Time
-        param8 = 0.55f;  // Ana Amount
+        param8 = 0.55f;  // Ana Strength
         param9 = 0.65f;  // Size Depth
         param10 = 0.55f; // Motion Point
         param11 = 0.55f; // Wave Lerp (higher = much longer ease)
-        param12 = 0.45f; // Edge Split
+        param12 = 0.45f; // Edge Strength
         param13 = 0.22f; // Edge Sense (conservative)
         param14 = 0.55f; // Edge Lerp
         param15 = 0.40f; // Anticipate
-        param16 = 0.55f; // Mot Depth
+        param16 = 0.55f; // Mot Strength
         param17 = 0.45f; // Mot Soft
+        param18 = 0.85f; // Pop Strength
         anaglyphOn = true;
+        popOn = true;
+        edgeOn = true;
         motion3DOn = false;
         optionPage = 0;
     }
@@ -1495,6 +1513,8 @@ public:
         showMotion = false;
         showHeight = false;
         showEdges = false;
+        popOn = true;
+        edgeOn = true;
         motion3DOn = false;
         optionPage = 0;
     }
@@ -1517,6 +1537,7 @@ public:
     bool hasParam15() const override { return true; }
     bool hasParam16() const override { return true; }
     bool hasParam17() const override { return true; }
+    bool hasParam18() const override { return true; }
     std::string param1Name() const override { return "Strictness"; }
     std::string param2Name() const override { return "Wave Soft"; }
     std::string param3Name() const override { return "Wave Radius"; }
@@ -1524,16 +1545,17 @@ public:
     std::string param5Name() const override { return "Orbit Pitch"; }
     std::string param6Name() const override { return "Pop Scale"; }
     std::string param7Name() const override { return "Hold Time"; }
-    std::string param8Name() const override { return "Ana Amount"; }
+    std::string param8Name() const override { return "Ana Strength"; }
     std::string param9Name() const override { return "Size Depth"; }
     std::string param10Name() const override { return "Motion Point"; }
     std::string param11Name() const override { return "Wave Lerp"; }
-    std::string param12Name() const override { return "Edge Split"; }
+    std::string param12Name() const override { return "Edge Strength"; }
     std::string param13Name() const override { return "Edge Sense"; }
     std::string param14Name() const override { return "Edge Lerp"; }
     std::string param15Name() const override { return "Anticipate"; }
-    std::string param16Name() const override { return "Mot Depth"; }
+    std::string param16Name() const override { return "Mot Strength"; }
     std::string param17Name() const override { return "Mot Soft"; }
+    std::string param18Name() const override { return "Pop Strength"; }
     bool hasReset() const override { return true; }
 
     int optionPageCount() const override { return 5; }
@@ -1547,10 +1569,11 @@ public:
             default: return "Params";
         }
     }
-    bool showStrengthOnPage() const override { return optionPage == 0; }
+    // Master Strength is available on every page
+    bool showStrengthOnPage() const override { return true; }
     bool showParamOnPage(int n) const override {
         switch (optionPage) {
-            case 0: return n == 1 || n == 2 || n == 3 || n == 6 || n == 7 || n == 9 || n == 10;
+            case 0: return n == 18 || n == 1 || n == 2 || n == 3 || n == 6 || n == 7 || n == 9 || n == 10;
             case 1: return n == 11 || n == 15;
             case 2: return n == 12 || n == 13 || n == 14;
             case 3: return n == 4 || n == 5 || n == 8;
@@ -1559,43 +1582,49 @@ public:
         }
     }
 
-    int toolButtonCount() const override { return 9; }
+    int toolButtonCount() const override { return 11; }
     std::string toolButtonName(int i) const override {
         switch (i) {
-            case 0: return motion3DOn ? "Mot3D ON" : "Mot3D";
-            case 1: return anaglyphOn ? "Ana ON" : "Ana OFF";
-            case 2: return "Front";
-            case 3: return "Reset";
-            case 4: return "Tracks";
-            case 5: return "Motion";
-            case 6: return "Height";
-            case 7: return "Edges";
-            case 8: return "Relearn";
+            case 0: return popOn ? "Pop ON" : "Pop";
+            case 1: return edgeOn ? "Edge ON" : "Edge";
+            case 2: return motion3DOn ? "Mot3D ON" : "Mot3D";
+            case 3: return anaglyphOn ? "Ana ON" : "Ana";
+            case 4: return "Front";
+            case 5: return "Reset";
+            case 6: return "Tracks";
+            case 7: return "Motion";
+            case 8: return "Height";
+            case 9: return "EdDbg";
+            case 10: return "Relearn";
             default: return "";
         }
     }
     bool toolButtonActive(int i) const override {
         switch (i) {
-            case 0: return motion3DOn;
-            case 1: return anaglyphOn;
-            case 4: return showTracks;
-            case 5: return showMotion;
-            case 6: return showHeight;
-            case 7: return showEdges;
+            case 0: return popOn;
+            case 1: return edgeOn;
+            case 2: return motion3DOn;
+            case 3: return anaglyphOn;
+            case 6: return showTracks;
+            case 7: return showMotion;
+            case 8: return showHeight;
+            case 9: return showEdges;
             default: return false;
         }
     }
     void toolButtonClick(int i) override {
         switch (i) {
-            case 0: motion3DOn = !motion3DOn; if (motion3DOn) optionPage = 4; break;
-            case 1: anaglyphOn = !anaglyphOn; break;
-            case 2: param4 = 0.5f; param5 = 0.0f; break;
-            case 3: reset(); break;
-            case 4: showTracks = !showTracks; break;
-            case 5: showMotion = !showMotion; break;
-            case 6: showHeight = !showHeight; break;
-            case 7: showEdges = !showEdges; break;
-            case 8: resetTracking(); break;
+            case 0: popOn = !popOn; if (popOn) optionPage = 0; break;
+            case 1: edgeOn = !edgeOn; if (edgeOn) optionPage = 2; break;
+            case 2: motion3DOn = !motion3DOn; if (motion3DOn) optionPage = 4; break;
+            case 3: anaglyphOn = !anaglyphOn; if (anaglyphOn) optionPage = 3; break;
+            case 4: param4 = 0.5f; param5 = 0.0f; break;
+            case 5: reset(); break;
+            case 6: showTracks = !showTracks; break;
+            case 7: showMotion = !showMotion; break;
+            case 8: showHeight = !showHeight; break;
+            case 9: showEdges = !showEdges; break;
+            case 10: resetTracking(); break;
             default: break;
         }
     }
@@ -1611,8 +1640,10 @@ public:
         ss << optionPageName(optionPage)
            << " | tr " << tracks.size() << "/" << mature
            << " ed " << liveEdges << "/" << edgeTracks.size()
+           << (popOn ? " | Pop" : "")
+           << (edgeOn ? " | Edge" : "")
            << (motion3DOn ? " | Mot3D" : "")
-           << (anaglyphOn ? " | ana" : "");
+           << (anaglyphOn ? " | Ana" : "");
         return ss.str();
     }
 };
@@ -3363,7 +3394,7 @@ static bool aeShowsParam(const std::unique_ptr<VideoFilter>& f, int n) {
             case 11: return f->hasParam11(); case 12: return f->hasParam12();
             case 13: return f->hasParam13(); case 14: return f->hasParam14();
             case 15: return f->hasParam15(); case 16: return f->hasParam16();
-            case 17: return f->hasParam17();
+            case 17: return f->hasParam17(); case 18: return f->hasParam18();
             default: return false;
         }
     };
@@ -3397,7 +3428,7 @@ float activeEffectsContentHeight() {
         h += AE_NAME_STEP;
         if (!filter->statusLine().empty()) h += AE_STATUS_STEP;
         if (aeShowsStrength(filter)) h += AE_PARAM_STEP;
-        for (int p = 1; p <= 17; ++p)
+        for (int p = 1; p <= 18; ++p)
             if (aeShowsParam(filter, p)) h += AE_PARAM_STEP;
         int tools = filter->toolButtonCount();
         if (tools > 0) {
@@ -3510,7 +3541,10 @@ void drawActiveEffectsPanel() {
             currentY -= (AE_SLIDER_H + AE_SLIDER_GAP);
         };
 
-        if (aeShowsStrength(filters[i])) drawParam(filters[i]->strength, "Strength");
+        if (aeShowsStrength(filters[i])) drawParam(filters[i]->strength,
+            filters[i]->name() == "EnceladusVision" ? "Master Strength" : "Strength");
+        // Pop Strength (18) drawn right after Master when on Pop page
+        if (aeShowsParam(filters[i], 18)) drawParam(filters[i]->param18, filters[i]->param18Name());
         if (aeShowsParam(filters[i], 1)) drawParam(filters[i]->param1, filters[i]->param1Name());
         if (aeShowsParam(filters[i], 2)) drawParam(filters[i]->param2, filters[i]->param2Name());
         if (aeShowsParam(filters[i], 3)) drawParam(filters[i]->param3, filters[i]->param3Name());
@@ -3636,6 +3670,7 @@ bool hitTestActiveEffectsSliders(float fx, float fy) {
         };
 
         if (aeShowsStrength(filters[i]) && trySlider(0, filters[i]->strength)) return true;
+        if (aeShowsParam(filters[i], 18) && trySlider(18, filters[i]->param18)) return true;
         if (aeShowsParam(filters[i], 1) && trySlider(1, filters[i]->param1)) return true;
         if (aeShowsParam(filters[i], 2) && trySlider(2, filters[i]->param2)) return true;
         if (aeShowsParam(filters[i], 3) && trySlider(3, filters[i]->param3)) return true;
@@ -4255,6 +4290,7 @@ void mouseMotion(int x, int y) {
         case 15: filters[filterIdx]->param15 = normalizedValue; break;
         case 16: filters[filterIdx]->param16 = normalizedValue; break;
         case 17: filters[filterIdx]->param17 = normalizedValue; break;
+        case 18: filters[filterIdx]->param18 = normalizedValue; break;
     }
 
     glutPostRedisplay();
@@ -4399,6 +4435,7 @@ void keyboard(unsigned char key, int x, int y) {
                     case 15: filters[filterIdx]->param15 = std::max(0.0f, filters[filterIdx]->param15 - step); break;
                     case 16: filters[filterIdx]->param16 = std::max(0.0f, filters[filterIdx]->param16 - step); break;
                     case 17: filters[filterIdx]->param17 = std::max(0.0f, filters[filterIdx]->param17 - step); break;
+                    case 18: filters[filterIdx]->param18 = std::max(0.0f, filters[filterIdx]->param18 - step); break;
                 }
             } else {
                 videoScale = std::max(VIDEO_SCALE_MIN, videoScale - 0.05f);
@@ -4429,6 +4466,7 @@ void keyboard(unsigned char key, int x, int y) {
                     case 15: filters[filterIdx]->param15 = std::min(1.0f, filters[filterIdx]->param15 + step); break;
                     case 16: filters[filterIdx]->param16 = std::min(1.0f, filters[filterIdx]->param16 + step); break;
                     case 17: filters[filterIdx]->param17 = std::min(1.0f, filters[filterIdx]->param17 + step); break;
+                    case 18: filters[filterIdx]->param18 = std::min(1.0f, filters[filterIdx]->param18 + step); break;
                 }
             } else {
                 videoScale = std::min(VIDEO_SCALE_MAX, videoScale + 0.05f);
