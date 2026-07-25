@@ -142,11 +142,19 @@ Calibration tools: Reset, Front, Ana ON/OFF, Tracks / Motion / Height overlays, 
 
 ### Live window capture (X11)
 
-**Win** button or **I** opens a list of top-level windows plus **Full Desktop / Screen**. Selecting one streams that region into the filter pipeline in real time (same filters as camera/file). Refresh rescans open windows. Requires an X11 session (`XDG_SESSION_TYPE=x11`).
+**Win** button or **I** opens a list of top-level windows plus **Full Desktop / Screen**. Selecting one streams that region into the filter pipeline in real time. Requires an X11 session.
+
+**Window Capture Tune** (appears while live): Crop L/R/T/B, Scale (downscale for performance), Cap FPS (~8–60), Reset Cap.
+
+### Aspect format presets
+
+**Aspect Formats** panel (right column, under Filters): pick cinema/delivery ratios and apply as **Crop** (center-cut) or **Letter** (pad bars). **Off** restores native aspect. Active format also draws a gold guide on the video window.
+
+Presets include: 1:1, 5:4, 4:3, 3:2, 16:10, 16:9, 1.85 Flat, **1.90 IMAX Digital**, 2:1, 21:9, 2.20 70mm, 2.35/2.39/2.40 Scope, 2.76 Ultra Panavision, **1.43 IMAX GT**, 4:5, 9:16, 32:9.
 
 ```bash
 ./Enceladus_Video_Patcher --enable-enceladusvision
-# then press I / click Win and pick a window
+# I / Win → pick window; use Capture Tune + Aspect Formats panels
 ```
 
 ## Examples

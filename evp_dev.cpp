@@ -105,11 +105,59 @@ bool guideAspect43 = false;
 bool guideAspect239 = false;
 
 // Control-panel layout: guides/placement sit in a middle column so Active Effects
-// can use the full left column for filter sliders.
+// can use the full left column for filter sliders. Aspect formats sit under the
+// Filters list on the right so they stay clear of transport / timeline.
 const float GUIDE_PANEL_X = -0.45f;
 const float GUIDE_PANEL_Y = 0.58f;
 const float PLACE_PANEL_X = -0.45f;
 const float PLACE_PANEL_Y = 0.10f;
+const float FORMAT_PANEL_X = 0.48f;
+const float FORMAT_PANEL_Y = 0.06f;
+const float FORMAT_PANEL_H = 0.54f;
+const float CAP_PANEL_X = -0.45f;
+const float CAP_PANEL_Y = 0.92f;
+
+// Cinema / delivery aspect presets (width / height)
+struct AspectFormat {
+    const char* name;
+    float aspect; // w/h
+};
+static const AspectFormat kAspectFormats[] = {
+    {"1:1 Square", 1.0f},
+    {"5:4", 5.0f / 4.0f},
+    {"4:3 Academy/SD", 4.0f / 3.0f},
+    {"3:2 Classic", 3.0f / 2.0f},
+    {"16:10", 16.0f / 10.0f},
+    {"16:9 HD/UHD", 16.0f / 9.0f},
+    {"1.85 Flat", 1.85f},
+    {"1.90 IMAX Dig", 1.90f},
+    {"2:1 Univisium", 2.0f},
+    {"21:9 UltraWide", 21.0f / 9.0f},
+    {"2.20 70mm", 2.20f},
+    {"2.35 Scope", 2.35f},
+    {"2.39 Anamorphic", 2.39f},
+    {"2.40 Wide Scope", 2.40f},
+    {"2.76 Ultra Pana", 2.76f},
+    {"1.43 IMAX GT", 1.43f},
+    {"4:5 Portrait", 4.0f / 5.0f},
+    {"9:16 Stories", 9.0f / 16.0f},
+    {"32:9 SuperUW", 32.0f / 9.0f},
+};
+static const int kAspectFormatCount = static_cast<int>(sizeof(kAspectFormats) / sizeof(kAspectFormats[0]));
+int formatPresetIndex = -1; // -1 = native (off)
+int formatMode = 1;         // 0 = letterbox/pillarbox, 1 = center crop
+int formatListScroll = 0;
+const int FORMAT_LIST_ROWS = 6;
+
+// Window-capture tuning (normalized crop fractions + performance)
+float capCropL = 0.0f;
+float capCropR = 0.0f;
+float capCropT = 0.0f;
+float capCropB = 0.0f;
+float capDownscale = 1.0f; // 0.25..1.0 of captured resolution before filters
+float capFpsNorm = 0.55f;  // maps to ~8–60 fps
+int activeCapSlider = -1;
+double lastCapGrabTime = 0.0;
 
 // Source picker menus (file browser / webcam list / window capture)
 enum class SourceMenuMode { Closed, Files, Cameras, Windows };
@@ -144,7 +192,8 @@ int filterListScroll = 0;
 const float FILT_PANEL_X = 0.48f;
 const float FILT_PANEL_W = 0.48f;
 const float FILT_PANEL_TOP = 0.82f;
-const float FILT_PANEL_BOTTOM = -0.68f;
+// Leave room under Filters for Aspect Formats (above view/transport).
+const float FILT_PANEL_BOTTOM = 0.12f;
 const float FILT_ROW_H = 0.072f;
 const float FILT_BTN_H = 0.055f;
 
@@ -1807,6 +1856,86 @@ bool grabX11WindowFrame(Window win, cv::Mat& outBgr) {
     return !outBgr.empty();
 }
 
+float captureTargetFps() {
+    // Slider: 0 → ~8 fps, 0.55 → ~30, 1 → ~60
+    return 8.0f + capFpsNorm * 52.0f;
+}
+
+void resetCaptureTune() {
+    capCropL = capCropR = capCropT = capCropB = 0.0f;
+    capDownscale = 1.0f;
+    capFpsNorm = 0.55f;
+}
+
+cv::Mat applyCaptureTune(const cv::Mat& frame) {
+    if (frame.empty()) return frame;
+    cv::Mat out = frame;
+
+    float cl = std::max(0.0f, std::min(0.45f, capCropL));
+    float cr = std::max(0.0f, std::min(0.45f, capCropR));
+    float ct = std::max(0.0f, std::min(0.45f, capCropT));
+    float cb = std::max(0.0f, std::min(0.45f, capCropB));
+    if (cl + cr >= 0.95f) { cl = 0.0f; cr = 0.0f; }
+    if (ct + cb >= 0.95f) { ct = 0.0f; cb = 0.0f; }
+
+    if (cl > 0.0005f || cr > 0.0005f || ct > 0.0005f || cb > 0.0005f) {
+        int x0 = static_cast<int>(frame.cols * cl);
+        int y0 = static_cast<int>(frame.rows * ct);
+        int x1 = frame.cols - static_cast<int>(frame.cols * cr);
+        int y1 = frame.rows - static_cast<int>(frame.rows * cb);
+        x0 = std::max(0, std::min(frame.cols - 2, x0));
+        y0 = std::max(0, std::min(frame.rows - 2, y0));
+        x1 = std::max(x0 + 2, std::min(frame.cols, x1));
+        y1 = std::max(y0 + 2, std::min(frame.rows, y1));
+        out = frame(cv::Rect(x0, y0, x1 - x0, y1 - y0)).clone();
+    }
+
+    float scale = std::max(0.25f, std::min(1.0f, capDownscale));
+    if (scale < 0.995f && !out.empty()) {
+        cv::Mat scaled;
+        cv::resize(out, scaled, cv::Size(), scale, scale, cv::INTER_AREA);
+        out = scaled;
+    }
+    return out;
+}
+
+cv::Mat applyFormatAspect(const cv::Mat& frame) {
+    if (frame.empty() || formatPresetIndex < 0 || formatPresetIndex >= kAspectFormatCount)
+        return frame;
+    const float target = kAspectFormats[formatPresetIndex].aspect;
+    if (target < 0.05f) return frame;
+    const float src = static_cast<float>(frame.cols) / std::max(1, frame.rows);
+    if (std::fabs(src - target) < 0.008f) return frame;
+
+    if (formatMode == 0) {
+        // Letterbox / pillarbox — keep full image, pad to target aspect
+        if (src > target) {
+            int newH = std::max(2, static_cast<int>(std::lround(frame.cols / target)));
+            int pad = (newH - frame.rows) / 2;
+            cv::Mat out;
+            cv::copyMakeBorder(frame, out, pad, newH - frame.rows - pad, 0, 0,
+                               cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
+            return out;
+        }
+        int newW = std::max(2, static_cast<int>(std::lround(frame.rows * target)));
+        int pad = (newW - frame.cols) / 2;
+        cv::Mat out;
+        cv::copyMakeBorder(frame, out, 0, 0, pad, newW - frame.cols - pad,
+                           cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
+        return out;
+    }
+
+    // Center crop to target aspect
+    if (src > target) {
+        int newW = std::max(2, static_cast<int>(std::lround(frame.rows * target)));
+        int x0 = (frame.cols - newW) / 2;
+        return frame(cv::Rect(x0, 0, newW, frame.rows)).clone();
+    }
+    int newH = std::max(2, static_cast<int>(std::lround(frame.cols / target)));
+    int y0 = (frame.rows - newH) / 2;
+    return frame(cv::Rect(0, y0, frame.cols, newH)).clone();
+}
+
 std::string makeWindowSourceId(const CaptureWindow& w) {
     if (w.isScreen) return "win:screen";
     std::ostringstream oss;
@@ -1851,6 +1980,7 @@ bool startWindowCapture(const std::string& source) {
     if (captureWindowTitle.empty())
         captureWindowTitle = source;
     videoDuration = 0.0;
+    lastCapGrabTime = 0.0;
     return true;
 }
 
@@ -2920,6 +3050,8 @@ void setControlFullscreen(bool enable);
 void applyVideoGeometry();
 bool hitTestPlacementPanel(float fx, float fy);
 bool hitTestGuidesPanel(float fx, float fy);
+bool hitTestFormatPanel(float fx, float fy);
+bool hitTestCapturePanel(float fx, float fy);
 bool hitTestFilterListPanel(float fx, float fy);
 
 void mouse(int button, int state, int x, int y) {
@@ -3060,6 +3192,12 @@ void mouse(int button, int state, int x, int y) {
             if (hitTestGuidesPanel(fx, fy)) {
                 return;
             }
+            if (hitTestFormatPanel(fx, fy)) {
+                return;
+            }
+            if (hitTestCapturePanel(fx, fy)) {
+                return;
+            }
 
             // When pie is open, handle it before other empty-area actions
             if (showPieMenu) {
@@ -3115,6 +3253,7 @@ void mouse(int button, int state, int x, int y) {
             activeSlider = -1;
             activeViewSlider = -1;
             activePlaceSlider = -1;
+            activeCapSlider = -1;
             isSeeking = false;
         }
     }
@@ -3134,6 +3273,22 @@ void mouseMotion(int x, int y) {
     }
 
     if (!showUI) return;
+
+    if (activeCapSlider >= 0 && mouseLeftDown) {
+        float left = (activeCapSlider == 1 || activeCapSlider == 3 || activeCapSlider == 5)
+            ? (CAP_PANEL_X + 0.28f) : (CAP_PANEL_X + 0.02f);
+        float norm = std::max(0.0f, std::min(1.0f, (fx - left) / 0.22f));
+        switch (activeCapSlider) {
+            case 0: capCropL = std::min(0.45f, norm); break;
+            case 1: capCropR = std::min(0.45f, norm); break;
+            case 2: capCropT = std::min(0.45f, norm); break;
+            case 3: capCropB = std::min(0.45f, norm); break;
+            case 4: capDownscale = std::max(0.25f, norm); break;
+            case 5: capFpsNorm = norm; break;
+        }
+        glutPostRedisplay();
+        return;
+    }
 
     if (activePlaceSlider >= 0 && mouseLeftDown) {
         int sw = std::max(1, glutGet(GLUT_SCREEN_WIDTH));
@@ -3625,7 +3780,8 @@ void drawAspectGuide(float aspect) {
 void drawCalibrationGuides() {
     bool any = guideCrosshair || guideEdgeBorder || guideThirds || guideGrid ||
                guideActionSafe || guideTitleSafe || guideAspect169 ||
-               guideAspect43 || guideAspect239;
+               guideAspect43 || guideAspect239 ||
+               (formatPresetIndex >= 0 && formatPresetIndex < kAspectFormatCount);
     if (!any) return;
 
     glEnable(GL_BLEND);
@@ -3674,6 +3830,12 @@ void drawCalibrationGuides() {
         glColor4f(1.0f, 0.5f, 0.9f, 0.9f);
         drawAspectGuide(2.39f);
     }
+    if (formatPresetIndex >= 0 && formatPresetIndex < kAspectFormatCount) {
+        glColor4f(1.0f, 0.85f, 0.35f, 0.95f);
+        glLineWidth(2.0f);
+        drawAspectGuide(kAspectFormats[formatPresetIndex].aspect);
+        glLineWidth(1.0f);
+    }
 
     if (guideEdgeBorder) {
         glColor4f(1.0f, 1.0f, 1.0f, 0.95f);
@@ -3713,10 +3875,15 @@ void processCaptureFrame() {
 
     cv::Mat frame;
     if (windowCaptureActive) {
+        double now = glutGet(GLUT_ELAPSED_TIME) / 1000.0;
+        double minDt = 1.0 / static_cast<double>(captureTargetFps());
+        if (lastCapGrabTime > 0.0 && (now - lastCapGrabTime) < minDt)
+            return;
         if (!grabX11WindowFrame(captureXid, frame)) {
-            // Window closed or unmapped — keep last frame
             return;
         }
+        lastCapGrabTime = now;
+        frame = applyCaptureTune(frame);
         currentVideoTime += deltaTime;
     } else {
         cap >> frame;
@@ -3739,6 +3906,7 @@ void processCaptureFrame() {
 
     for (auto& filter : filters)
         frame = filter->apply(frame);
+    frame = applyFormatAspect(frame);
     cv::flip(frame, frame, 0);
     latestFrame = frame;
 }
@@ -3896,6 +4064,153 @@ bool hitTestGuidesPanel(float fx, float fy) {
     return false;
 }
 
+void drawFormatPanel() {
+    const float panelH = FORMAT_PANEL_H;
+    const float panelW = FILT_PANEL_W;
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glColor4f(0.08f, 0.08f, 0.12f, 0.85f);
+    glBegin(GL_QUADS);
+    glVertex2f(FORMAT_PANEL_X, FORMAT_PANEL_Y - panelH);
+    glVertex2f(FORMAT_PANEL_X + panelW, FORMAT_PANEL_Y - panelH);
+    glVertex2f(FORMAT_PANEL_X + panelW, FORMAT_PANEL_Y + 0.04f);
+    glVertex2f(FORMAT_PANEL_X, FORMAT_PANEL_Y + 0.04f);
+    glEnd();
+    glDisable(GL_BLEND);
+
+    glColor3f(1, 1, 1);
+    drawText(FORMAT_PANEL_X + 0.02f, FORMAT_PANEL_Y + 0.01f, "Aspect Formats", GLUT_BITMAP_HELVETICA_12);
+
+    drawButton(FORMAT_PANEL_X + 0.02f, FORMAT_PANEL_Y - 0.05f, 0.10f, 0.042f, "Off", false, formatPresetIndex < 0);
+    drawButton(FORMAT_PANEL_X + 0.13f, FORMAT_PANEL_Y - 0.05f, 0.11f, 0.042f, "Crop", false, formatMode == 1);
+    drawButton(FORMAT_PANEL_X + 0.25f, FORMAT_PANEL_Y - 0.05f, 0.12f, 0.042f, "Letter", false, formatMode == 0);
+    drawButton(FORMAT_PANEL_X + 0.38f, FORMAT_PANEL_Y - 0.05f, 0.08f, 0.042f, "Up");
+
+    formatListScroll = std::max(0, std::min(formatListScroll,
+        std::max(0, kAspectFormatCount - FORMAT_LIST_ROWS)));
+
+    const float rowH = 0.055f;
+    const float listTop = FORMAT_PANEL_Y - 0.11f;
+    for (int i = 0; i < FORMAT_LIST_ROWS; ++i) {
+        int idx = formatListScroll + i;
+        if (idx >= kAspectFormatCount) break;
+        float y = listTop - i * rowH;
+        bool on = (idx == formatPresetIndex);
+        drawButton(FORMAT_PANEL_X + 0.02f, y - 0.04f, panelW - 0.04f, 0.048f,
+                   kAspectFormats[idx].name, false, on);
+    }
+    drawButton(FORMAT_PANEL_X + 0.02f, FORMAT_PANEL_Y - panelH + 0.02f, 0.21f, 0.042f, "Prev");
+    drawButton(FORMAT_PANEL_X + 0.25f, FORMAT_PANEL_Y - panelH + 0.02f, 0.21f, 0.042f, "Next");
+}
+
+bool hitTestFormatPanel(float fx, float fy) {
+    const float panelH = FORMAT_PANEL_H;
+    const float panelW = FILT_PANEL_W;
+    if (fx < FORMAT_PANEL_X || fx > FORMAT_PANEL_X + panelW ||
+        fy < FORMAT_PANEL_Y - panelH || fy > FORMAT_PANEL_Y + 0.04f)
+        return false;
+
+    if (isInside(fx, fy, FORMAT_PANEL_X + 0.02f, FORMAT_PANEL_Y - 0.05f, 0.10f, 0.042f)) {
+        formatPresetIndex = -1;
+        return true;
+    }
+    if (isInside(fx, fy, FORMAT_PANEL_X + 0.13f, FORMAT_PANEL_Y - 0.05f, 0.11f, 0.042f)) {
+        formatMode = 1;
+        return true;
+    }
+    if (isInside(fx, fy, FORMAT_PANEL_X + 0.25f, FORMAT_PANEL_Y - 0.05f, 0.12f, 0.042f)) {
+        formatMode = 0;
+        return true;
+    }
+    if (isInside(fx, fy, FORMAT_PANEL_X + 0.38f, FORMAT_PANEL_Y - 0.05f, 0.08f, 0.042f)) {
+        formatListScroll = std::max(0, formatListScroll - FORMAT_LIST_ROWS);
+        return true;
+    }
+
+    const float rowH = 0.055f;
+    const float listTop = FORMAT_PANEL_Y - 0.11f;
+    for (int i = 0; i < FORMAT_LIST_ROWS; ++i) {
+        int idx = formatListScroll + i;
+        if (idx >= kAspectFormatCount) break;
+        float y = listTop - i * rowH;
+        if (isInside(fx, fy, FORMAT_PANEL_X + 0.02f, y - 0.04f, panelW - 0.04f, 0.048f)) {
+            formatPresetIndex = idx;
+            return true;
+        }
+    }
+    if (isInside(fx, fy, FORMAT_PANEL_X + 0.02f, FORMAT_PANEL_Y - panelH + 0.02f, 0.21f, 0.042f)) {
+        formatListScroll = std::max(0, formatListScroll - FORMAT_LIST_ROWS);
+        return true;
+    }
+    if (isInside(fx, fy, FORMAT_PANEL_X + 0.25f, FORMAT_PANEL_Y - panelH + 0.02f, 0.21f, 0.042f)) {
+        int maxScroll = std::max(0, kAspectFormatCount - FORMAT_LIST_ROWS);
+        formatListScroll = std::min(maxScroll, formatListScroll + FORMAT_LIST_ROWS);
+        return true;
+    }
+    return true;
+}
+
+void drawCapturePanel() {
+    if (!windowCaptureActive) return;
+    const float panelH = 0.30f;
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glColor4f(0.08f, 0.10f, 0.14f, 0.90f);
+    glBegin(GL_QUADS);
+    glVertex2f(CAP_PANEL_X, CAP_PANEL_Y - panelH);
+    glVertex2f(CAP_PANEL_X + 0.52f, CAP_PANEL_Y - panelH);
+    glVertex2f(CAP_PANEL_X + 0.52f, CAP_PANEL_Y + 0.03f);
+    glVertex2f(CAP_PANEL_X, CAP_PANEL_Y + 0.03f);
+    glEnd();
+    glDisable(GL_BLEND);
+
+    glColor3f(1, 1, 1);
+    drawText(CAP_PANEL_X + 0.02f, CAP_PANEL_Y + 0.005f, "Window Capture Tune", GLUT_BITMAP_HELVETICA_12);
+
+    drawSlider(CAP_PANEL_X + 0.02f, CAP_PANEL_Y - 0.05f, 0.22f, 0.020f, capCropL, "Crop L");
+    drawSlider(CAP_PANEL_X + 0.28f, CAP_PANEL_Y - 0.05f, 0.22f, 0.020f, capCropR, "Crop R");
+    drawSlider(CAP_PANEL_X + 0.02f, CAP_PANEL_Y - 0.12f, 0.22f, 0.020f, capCropT, "Crop T");
+    drawSlider(CAP_PANEL_X + 0.28f, CAP_PANEL_Y - 0.12f, 0.22f, 0.020f, capCropB, "Crop B");
+    drawSlider(CAP_PANEL_X + 0.02f, CAP_PANEL_Y - 0.19f, 0.22f, 0.020f, capDownscale, "Scale");
+    drawSlider(CAP_PANEL_X + 0.28f, CAP_PANEL_Y - 0.19f, 0.22f, 0.020f, capFpsNorm, "Cap FPS");
+
+    char fpsBuf[48];
+    std::snprintf(fpsBuf, sizeof(fpsBuf), "~%.0f fps", captureTargetFps());
+    glColor3f(0.75f, 0.85f, 1.0f);
+    drawText(CAP_PANEL_X + 0.02f, CAP_PANEL_Y - 0.24f, fpsBuf, GLUT_BITMAP_HELVETICA_10);
+    drawButton(CAP_PANEL_X + 0.28f, CAP_PANEL_Y - 0.28f, 0.22f, 0.045f, "Reset Cap");
+}
+
+bool hitTestCapturePanel(float fx, float fy) {
+    if (!windowCaptureActive) return false;
+    const float panelH = 0.30f;
+    if (fx < CAP_PANEL_X || fx > CAP_PANEL_X + 0.52f ||
+        fy < CAP_PANEL_Y - panelH || fy > CAP_PANEL_Y + 0.03f)
+        return false;
+
+    auto tryS = [&](int id, float x, float y, float& val) -> bool {
+        if (isInside(fx, fy, x, y, 0.22f, 0.020f)) {
+            activeCapSlider = id;
+            val = std::max(0.0f, std::min(1.0f, (fx - x) / 0.22f));
+            if (id <= 3) val = std::min(0.45f, val);
+            if (id == 4) val = std::max(0.25f, val);
+            return true;
+        }
+        return false;
+    };
+    if (tryS(0, CAP_PANEL_X + 0.02f, CAP_PANEL_Y - 0.05f, capCropL)) return true;
+    if (tryS(1, CAP_PANEL_X + 0.28f, CAP_PANEL_Y - 0.05f, capCropR)) return true;
+    if (tryS(2, CAP_PANEL_X + 0.02f, CAP_PANEL_Y - 0.12f, capCropT)) return true;
+    if (tryS(3, CAP_PANEL_X + 0.28f, CAP_PANEL_Y - 0.12f, capCropB)) return true;
+    if (tryS(4, CAP_PANEL_X + 0.02f, CAP_PANEL_Y - 0.19f, capDownscale)) return true;
+    if (tryS(5, CAP_PANEL_X + 0.28f, CAP_PANEL_Y - 0.19f, capFpsNorm)) return true;
+    if (isInside(fx, fy, CAP_PANEL_X + 0.28f, CAP_PANEL_Y - 0.28f, 0.22f, 0.045f)) {
+        resetCaptureTune();
+        return true;
+    }
+    return true;
+}
+
 void displayVideoWindow() {
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
@@ -3933,14 +4248,22 @@ void displayControlWindow() {
         drawFilterListPanel();
 
         drawViewControls();
+        drawCapturePanel();
         drawPlacementPanel();
         drawGuidesPanel();
+        drawFormatPanel();
         drawActiveEffectsPanel();
 
         drawText(-0.95f, 0.95f, "F Vid FS | H Ctl FS | V Open | C Cam | I Win capture");
-        drawText(-0.95f, 0.90f, "Drag video window edges to resize | Guides + Placement mid-left");
+        drawText(-0.95f, 0.90f, "Formats under Filters (right) | Capture tune when Win live");
+        if (formatPresetIndex >= 0 && formatPresetIndex < kAspectFormatCount) {
+            std::string mode = formatMode == 0 ? "letter" : "crop";
+            drawText(-0.95f, 0.85f, std::string("Format: ") + kAspectFormats[formatPresetIndex].name +
+                     " (" + mode + ")");
+        }
         if (windowCaptureActive && !captureWindowTitle.empty()) {
-            drawText(-0.95f, 0.85f, "Live: " + truncateLabel(captureWindowTitle, 70));
+            drawText(-0.95f, formatPresetIndex >= 0 ? 0.80f : 0.85f,
+                     "Live: " + truncateLabel(captureWindowTitle, 70));
         }
     }
 
